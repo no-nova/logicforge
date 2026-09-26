@@ -1,5 +1,5 @@
 import { nodeDelay, portCounts, specOf } from "./catalog";
-import { clockAt, evalGate, evalPrimitive, floatDefault } from "./eval";
+import { clockAt, evalGate, evalPrimitive, floatDefault } from "./logicEvaluation";
 import type {
   Circuit,
   CustomDef,
@@ -85,6 +85,13 @@ export function flatten(circuit: Circuit, defs: CustomDef[]): FlatNet {
           id: fid, kind: n.type, ins: [], outCount: 1, delay: 0, constVal: n.type === "VCC" ? 1 : 0, topId: isTop ? n.id : undefined,
         });
         sourceOf.set(portKey(n.id, "out", 0), valKey(fid, 0));
+        continue;
+      }
+
+      if (n.type === "TEXT") {
+        nodes.set(fid, {
+          id: fid, kind: "TEXT", ins: [], outCount: 0, delay: 0, topId: isTop ? n.id : undefined,
+        });
         continue;
       }
 

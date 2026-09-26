@@ -37,7 +37,7 @@ export {
   floatDefault,
   notVal,
   resolveBus,
-} from "./eval";
+} from "./logicEvaluation";
 
 export {
   circuitTruthTable,
@@ -52,4 +52,19 @@ export {
   valKey,
 } from "./netlist";
 
-export { GRID, localPort, nodeSize, portDir, portPos, snap, uid } from "./geometry";
+export {
+  GRID_SIZE as GRID,
+  GRID_SIZE,
+  generateUniqueId as uid,
+  generateUniqueId,
+  getLocalPortPosition as localPort,
+  getLocalPortPosition,
+  getNodeSize as nodeSize,
+  getNodeSize,
+  getPortDirection as portDir,
+  getPortDirection,
+  getPortPosition as portPos,
+  getPortPosition,
+  snapToGrid as snap,
+  snapToGrid,
+} from "./geometry";

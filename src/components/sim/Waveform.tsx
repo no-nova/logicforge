@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { type Val } from "@/lib/sim/circuit";
-import { type WaveSample } from "@/lib/sim/timed";
+import { type WaveSample } from "@/lib/sim/timedSimulationEngine";
 
 export interface Probe {
   key: string;

@@ -123,6 +123,10 @@ export const CATALOG: Record<Exclude<NodeKind, "CUSTOM">, CompSpec> = {
     type: "DELAY", group: "timing", name: "Delay", hint: "Buffer with a longer propagation delay",
     defaultDelay: 4, minIn: 1, maxIn: 1, defaultInputs: 1, ins: () => ["D"], outs: () => ["Y"],
   },
+  TEXT: {
+    type: "TEXT", group: "io", name: "Note", hint: "Editable text annotation — double-click to edit",
+    defaultDelay: 0, minIn: 0, maxIn: 0, defaultInputs: 0, ins: () => [], outs: () => [],
+  },
 };
 
 export const GROUP_LABEL: Record<CompGroup, string> = {

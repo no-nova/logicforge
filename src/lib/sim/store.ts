@@ -11,7 +11,9 @@ import {
   snap,
   uid,
 } from "./circuit";
-import { demoXor, emptyDoc } from "./demos";
+import { demoXor, emptyDoc } from "./demoCircuits";
+import { createLayer, defaultLayers, ensureLayers } from "./layers";
+import type { Region } from "./types";
 
 const LS_DOC = "logicforge.doc.v2";
 const LS_FILES = "logicforge.projects.v2";
@@ -113,6 +115,12 @@ function writeProjects(list: Project[]) {
   lsSet(LS_FILES, JSON.stringify(list.slice(0, 40)));
 }
 
+export function ensureRegions(doc: import("./types").Doc): import("./types").Doc {
+  const regions = (doc as any).regions as Region[] | undefined;
+  if (Array.isArray(regions)) return doc;
+  return { ...doc, regions: [] as Region[] };
+}
+
 export function defaultInputs(type: NodeKind): number {
   if (type === "CUSTOM") return 0;
   return CATALOG[type].defaultInputs;
@@ -169,6 +177,25 @@ export interface EditorAPI {
   paste: (x?: number, y?: number) => void;
   hasClipboard: boolean;
   alignSelected: (mode: "left" | "right" | "top" | "bottom" | "hspace" | "vspace") => void;
+  autoLayout: () => void;
+  convertToText: (ids?: string[]) => void;
+  // Painterly layers (far → near) — depth composition
+  activeLayerId: string | undefined;
+  layers: import("./types").Layer[];
+  flattenLayers: boolean;
+  setActiveLayer: (id: string) => void;
+  addLayer: (name?: string) => void;
+  renameLayer: (id: string, name: string) => void;
+  removeLayer: (id: string) => void;
+  moveSelectionToLayer: (layerId: string, ids?: string[]) => void;
+  toggleFlattenLayers: () => void;
+  // Regions (functional blocks)
+  regions: Region[];
+  createRegion: (ids?: string[], name?: string) => string | undefined;
+  updateRegion: (id: string, patch: Partial<Region>) => void;
+  deleteRegion: (id: string) => void;
+  moveRegion: (id: string, dx: number, dy: number) => void;
+  convertTextToComponent: (id: string, targetType?: NodeKind) => void;
   connect: (from: { node: string; port: number }, to: { node: string; port: number }) => void;
   makeCustom: (name: string) => void;
   reset: () => void;
@@ -190,28 +217,29 @@ function hydrateInitial(): { doc: Doc; currentId: string; projects: Project[] } 
   const currentId = lsGet(LS_CURRENT);
   if (currentId) {
     const hit = projects.find((p) => p.id === currentId);
-    if (hit) return { doc: hit.doc, currentId: hit.id, projects };
+    if (hit)   return { doc: ensureRegions(ensureLayers(hit.doc)), currentId: hit.id, projects: projects.map((pr) => ({ ...pr, doc: ensureRegions(ensureLayers(pr.doc)) })) };
   }
   try {
     const raw = lsGet(LS_DOC);
     if (raw) {
       const d = JSON.parse(raw) as Doc;
       if (Array.isArray(d.nodes)) {
+        const ensured = ensureRegions(ensureLayers({ ...d, defs: d.defs ?? [], name: d.name || "Untitled" }));
         const id = uid("f");
         const p: Project = {
           id,
-          name: d.name || "Untitled",
+          name: ensured.name || "Untitled",
           updatedAt: Date.now(),
-          doc: { ...d, defs: d.defs ?? [], name: d.name || "Untitled" },
+          doc: ensured,
         };
-        return { doc: p.doc, currentId: id, projects: [p, ...projects] };
+        return { doc: p.doc, currentId: id, projects: [p, ...projects.map((pr) => ({ ...pr, doc: ensureLayers(pr.doc) }))] };
       }
     }
   } catch {
     /* ignore */
   }
-  if (projects[0]) return { doc: projects[0].doc, currentId: projects[0].id, projects };
-  const demo = demoXor();
+  if (projects[0]) return { doc: ensureRegions(ensureLayers(projects[0].doc)), currentId: projects[0].id, projects: projects.map((pr) => ({ ...pr, doc: ensureRegions(ensureLayers(pr.doc)) })) };
+  const demo = ensureRegions(ensureLayers(demoXor()));
   const id = uid("f");
   const p: Project = { id, name: demo.name || "XOR from gates", updatedAt: Date.now(), doc: demo };
   return { doc: demo, currentId: id, projects: [p] };
@@ -308,6 +336,9 @@ export function useEditor(): EditorAPI {
       const spec = type === "CUSTOM" ? null : CATALOG[type];
       const prefix = AUTO_PREFIX[type];
       const label = prefix ? `${prefix}${docRef.current.nodes.filter((n) => n.type === type).length + 1}` : undefined;
+      const cur = docRef.current;
+      const ensured = ensureLayers(cur);
+      const active = ensured.activeLayerId ?? ensured.layers?.[ensured.layers.length - 1]?.id;
       const node: CNode = {
         id,
         type,
@@ -316,13 +347,14 @@ export function useEditor(): EditorAPI {
         rot: 0,
         inputs: defaultInputs(type),
         defId,
+        layerId: active,
         ...(label ? { label } : {}),
         ...(type === "INPUT" ? { value: 0 as const } : {}),
         ...(type === "CLOCK" ? { period: 12, domain: "clk" } : {}),
         ...(type === "COUNTER" ? { bits: 4 } : {}),
         ...(spec ? { delay: spec.defaultDelay } : {}),
       };
-      commit((d) => ({ ...d, nodes: [...d.nodes, node] }), `add ${spec?.name ?? type}`);
+      commit((d) => ({ ...ensureLayers(d), nodes: [...d.nodes, node] }), `add ${spec?.name ?? type}`);
       setSelection([id]);
       setSelectedWires([]);
       return id;
@@ -407,6 +439,94 @@ export function useEditor(): EditorAPI {
       allLocked ? "unlock" : "lock",
     );
   }, [selection, commit]);
+
+  // ——— Painterly layers ———
+  const setActiveLayer = useCallback((id: string) => {
+    commit((d) => ({ ...ensureLayers(d), activeLayerId: id }), "active layer");
+  }, [commit]);
+  const addLayer = useCallback((name?: string) => {
+    commit((d) => {
+      const ensured = ensureLayers(d);
+      const order = Math.max(0, ...(ensured.layers ?? []).map((l) => l.order)) + 1;
+      const lyr = createLayer(name, order);
+      return { ...ensured, layers: [...(ensured.layers ?? []), lyr], activeLayerId: lyr.id };
+    }, "add layer");
+  }, [commit]);
+  const renameLayer = useCallback((id: string, name: string) => {
+    commit((d) => ({ ...ensureLayers(d), layers: (ensureLayers(d).layers ?? []).map((l) => (l.id === id ? { ...l, name } : l)) }), "rename layer");
+  }, [commit]);
+  const removeLayer = useCallback((id: string) => {
+    commit((d) => {
+      const ensured = ensureLayers(d);
+      if ((ensured.layers ?? []).length <= 1) return ensured;
+      const nextLayers = (ensured.layers ?? []).filter((l) => l.id !== id).map((l, i) => ({ ...l, order: i }));
+      const fallback = nextLayers[nextLayers.length - 1]?.id ?? nextLayers[0].id;
+      const nextActive = ensured.activeLayerId === id ? fallback : ensured.activeLayerId;
+      // Move nodes on deleted layer to fallback
+      const nodes = ensured.nodes.map((n) => (n.layerId === id ? { ...n, layerId: fallback } : n));
+      return { ...ensured, layers: nextLayers, activeLayerId: nextActive, nodes };
+    }, "remove layer");
+  }, [commit]);
+  const moveSelectionToLayer = useCallback((layerId: string, ids?: string[]) => {
+    const targetIds = ids ?? selection;
+    if (!targetIds.length) return;
+    commit((d) => ({ ...ensureLayers(d), nodes: d.nodes.map((n) => (targetIds.includes(n.id) ? { ...n, layerId } : n)) }), "move layer");
+  }, [selection, commit]);
+  const toggleFlattenLayers = useCallback(() => {
+    commit((d) => ({ ...ensureLayers(d), flattenLayers: !ensureLayers(d).flattenLayers }), "toggle flatten");
+  }, [commit]);
+
+  // ——— Regions ———
+  const createRegion = useCallback((ids?: string[], name?: string) => {
+    const targetIds = ids ?? selection;
+    if (!targetIds.length) return undefined;
+    const cur = docRef.current;
+    const nodes = cur.nodes.filter((n) => targetIds.includes(n.id));
+    if (!nodes.length) return undefined;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of nodes) {
+      const { w, h } = nodeSize(n, cur.defs);
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + w);
+      maxY = Math.max(maxY, n.y + h);
+    }
+    const pad = 16;
+    const id = uid("reg_");
+    const palette = ["#4d9fff", "#34d399", "#f59e0b", "#a78bfa", "#f472b6", "#38bdf8"];
+    const color = palette[(cur.regions?.length ?? 0) % palette.length];
+    const region: Region = {
+      id,
+      name: name ?? `Block ${(cur.regions?.length ?? 0) + 1}`,
+      color,
+      x: snap(minX - pad),
+      y: snap(minY - pad),
+      w: snap(maxX - minX + pad * 2),
+      h: snap(maxY - minY + pad * 2),
+      nodeIds: [...targetIds],
+    };
+    commit((d) => ({ ...ensureRegions(ensureLayers(d)), regions: [...(ensureRegions(d).regions ?? []), region] }), "create region");
+    return id;
+  }, [selection, commit]);
+
+  const updateRegion = useCallback((id: string, patch: Partial<Region>) => {
+    commit((d) => ({ ...ensureRegions(d), regions: (ensureRegions(d).regions ?? []).map((r) => (r.id === id ? { ...r, ...patch } : r)) }), "update region");
+  }, [commit]);
+
+  const deleteRegion = useCallback((id: string) => {
+    commit((d) => ({ ...ensureRegions(d), regions: (ensureRegions(d).regions ?? []).filter((r) => r.id !== id) }), "delete region");
+  }, [commit]);
+
+  const moveRegion = useCallback((id: string, dx: number, dy: number) => {
+    commit((d) => {
+      const ensured = ensureRegions(d);
+      const reg = ensured.regions?.find((r) => r.id === id);
+      if (!reg) return ensured;
+      const movedNodes = ensured.nodes.map((n) => (reg.nodeIds.includes(n.id) && !n.locked ? { ...n, x: n.x + dx, y: n.y + dy } : n));
+      const movedRegions = ensured.regions!.map((r) => (r.id === id ? { ...r, x: r.x + dx, y: r.y + dy } : r));
+      return { ...ensured, nodes: movedNodes, regions: movedRegions };
+    }, "move region");
+  }, [commit]);
 
   // Lets a Probe/LED carry a "this is what I expect to see here" marker so
   // a circuit's outputs can be checked against a spec at a glance instead
@@ -550,6 +670,208 @@ export function useEditor(): EditorAPI {
     [selection, commit],
   );
 
+  const autoLayout = useCallback(() => {
+    const current = docRef.current;
+    if (!current.nodes.length) return;
+    // Only layout selected components, centered around their relative network.
+    // If fewer than 2 selected, layout the whole circuit (fallback to global).
+    // This keeps auto-layout compatible with both ortho and curve routing:
+    // layers are left→right signal-flow, so beziers and ortho elbows both flow forward,
+    // and the group stays where the user was working instead of jumping to (80,300).
+    const useSelection = selection.length >= 2;
+    const targetIds = useSelection ? selection : current.nodes.map((n) => n.id);
+    const targetSet = new Set(targetIds);
+    const targetNodes = current.nodes.filter((n) => targetSet.has(n.id));
+    if (!targetNodes.length) return;
+    // Compute centroid of the target group so we can re-center around it
+    const centroidX = targetNodes.reduce((s, n) => s + n.x, 0) / targetNodes.length;
+    const centroidY = targetNodes.reduce((s, n) => s + n.y, 0) / targetNodes.length;
+
+    commit((d) => {
+      // Work on a copy of all nodes, but only reposition the target set
+      const allNodes = d.nodes;
+      const allWires = d.wires;
+      // Build adjacency for the target subgraph (only wires where both ends are in targetSet
+      // are used for layering; external wires are ignored for level but kept for crossing calc if they connect inside)
+      const inMap = new Map<string, string[]>();
+      const outMap = new Map<string, string[]>();
+      for (const id of targetIds) {
+        inMap.set(id, []);
+        outMap.set(id, []);
+      }
+      for (const w of allWires) {
+        if (targetSet.has(w.from.node) && targetSet.has(w.to.node)) {
+          inMap.get(w.to.node)!.push(w.from.node);
+          outMap.get(w.from.node)!.push(w.to.node);
+        }
+      }
+      const isSource = (n: CNode) =>
+        n.type === "INPUT" ||
+        n.type === "CLOCK" ||
+        n.type === "VCC" ||
+        n.type === "GND" ||
+        n.type === "TEXT" ||
+        (inMap.get(n.id)?.length ?? 0) === 0;
+      const isSink = (n: CNode) => n.type === "OUTPUT" || n.type === "LED";
+
+      // Longest-path layering within the target subgraph
+      const level = new Map<string, number>();
+      for (const id of targetIds) {
+        const n = allNodes.find((x) => x.id === id)!;
+        level.set(id, isSource(n) ? 0 : -1);
+      }
+      let changed = true;
+      let iter = 0;
+      const maxIter = targetIds.length * 2;
+      while (changed && iter < maxIter) {
+        changed = false;
+        iter++;
+        for (const w of allWires) {
+          if (!targetSet.has(w.from.node) || !targetSet.has(w.to.node)) continue;
+          const fromLev = level.get(w.from.node) ?? -1;
+          if (fromLev === -1) continue;
+          const toLev = level.get(w.to.node) ?? -1;
+          if (toLev < fromLev + 1) {
+            level.set(w.to.node, fromLev + 1);
+            changed = true;
+          }
+        }
+      }
+      let maxLevel = Math.max(...Array.from(level.values()).filter((v) => v >= 0), 0);
+      for (const id of targetIds) {
+        if ((level.get(id) ?? -1) < 0) {
+          const n = allNodes.find((x) => x.id === id)!;
+          level.set(id, isSink(n) ? maxLevel + 1 : 1);
+        }
+      }
+      maxLevel = Math.max(...Array.from(level.values()));
+
+      const layers = new Map<number, CNode[]>();
+      for (let i = 0; i <= maxLevel; i++) layers.set(i, []);
+      for (const id of targetIds) {
+        const n = allNodes.find((x) => x.id === id)!;
+        const lev = level.get(id) ?? 0;
+        layers.get(lev)!.push(n);
+      }
+      // Initial order by current Y to preserve some stability
+      const orderIndex = new Map<string, number>();
+      for (let lev = 0; lev <= maxLevel; lev++) {
+        const layerNodes = layers.get(lev)!;
+        layerNodes.sort((a, b) => a.y - b.y);
+        layerNodes.forEach((n, i) => orderIndex.set(n.id, i));
+      }
+      // Barycenter crossing minimization
+      for (let it = 0; it < 4; it++) {
+        for (let lev = 1; lev <= maxLevel; lev++) {
+          const layerNodes = layers.get(lev)!;
+          const bary = new Map<string, number>();
+          for (const n of layerNodes) {
+            const preds = inMap.get(n.id) ?? [];
+            if (!preds.length) bary.set(n.id, orderIndex.get(n.id) ?? 0);
+            else {
+              const sum = preds.reduce((s, pid) => s + (orderIndex.get(pid) ?? 0), 0);
+              bary.set(n.id, sum / preds.length);
+            }
+          }
+          layerNodes.sort((a, b) => (bary.get(a.id) ?? 0) - (bary.get(b.id) ?? 0));
+          layerNodes.forEach((n, i) => orderIndex.set(n.id, i));
+        }
+        for (let lev = maxLevel - 1; lev >= 0; lev--) {
+          const layerNodes = layers.get(lev)!;
+          const bary = new Map<string, number>();
+          for (const n of layerNodes) {
+            const succs = outMap.get(n.id) ?? [];
+            bary.set(n.id, succs.length ? succs.reduce((s, pid) => s + (orderIndex.get(pid) ?? 0), 0) / succs.length : orderIndex.get(n.id) ?? 0);
+          }
+          layerNodes.sort((a, b) => (bary.get(a.id) ?? 0) - (bary.get(b.id) ?? 0));
+          layerNodes.forEach((n, i) => orderIndex.set(n.id, i));
+        }
+      }
+      // Assign relative positions around (0,0), then translate to centroid
+      // Use gaps that work for both ortho and curve (180x90 gives forward-flowing beziers and clean ortho elbows)
+      const X_GAP = 180;
+      const Y_GAP = 90;
+      // Compute relative layout centered at (0,0)
+      const relPos = new Map<string, { x: number; y: number }>();
+      let minRelX = Infinity, maxRelX = -Infinity, minRelY = Infinity, maxRelY = -Infinity;
+      for (let lev = 0; lev <= maxLevel; lev++) {
+        const layerNodes = layers.get(lev)!;
+        const layerHeight = Math.max(0, (layerNodes.length - 1) * Y_GAP);
+        const startY = -layerHeight / 2;
+        const x = lev * X_GAP - (maxLevel * X_GAP) / 2;
+        layerNodes.forEach((origNode, idx) => {
+          const y = startY + idx * Y_GAP;
+          relPos.set(origNode.id, { x, y });
+          minRelX = Math.min(minRelX, x);
+          maxRelX = Math.max(maxRelX, x);
+          minRelY = Math.min(minRelY, y);
+          maxRelY = Math.max(maxRelY, y);
+        });
+      }
+      // Translate relative positions to be centered at the original centroid
+      const newNodes = allNodes.map((n) => {
+        if (!targetSet.has(n.id)) return n;
+        const rel = relPos.get(n.id)!;
+        return { ...n, x: snap(centroidX + rel.x), y: snap(centroidY + rel.y) };
+      });
+      return { ...d, nodes: newNodes };
+    }, "auto layout");
+  }, [commit, selection]);
+
+  const convertToText = useCallback(
+    (ids?: string[]) => {
+      const targetIds = ids?.length ? ids : selection.length ? selection : [];
+      if (!targetIds.length) return;
+      commit((d) => {
+        const idSet = new Set(targetIds);
+        // Collect HDL-like text for network if needed - here we create per-node TEXT
+        const newNodes = d.nodes.map((n) => {
+          if (!idSet.has(n.id)) return n;
+          if (n.type === "TEXT") return n;
+          const title = n.label ?? n.type;
+          const hdlSnippet = `// ${title} (${n.type})\n// Converted to editable text\n${title}`;
+          return {
+            ...n,
+            type: "TEXT" as NodeKind,
+            text: n.text ?? hdlSnippet,
+            inputs: 0,
+            label: n.label,
+          };
+        });
+        // Remove wires that were incident to converted nodes (TEXT has no ports)
+        const newWires = d.wires.filter((w) => !idSet.has(w.from.node) && !idSet.has(w.to.node));
+        return { ...d, nodes: newNodes, wires: newWires };
+      }, "convert to text");
+    },
+    [selection, commit],
+  );
+
+  const convertTextToComponent = useCallback(
+    (id: string, targetType: NodeKind = "BUFFER") => {
+      commit((d) => {
+        const node = d.nodes.find((n) => n.id === id);
+        if (!node || node.type !== "TEXT") return d;
+        const spec = CATALOG[targetType as Exclude<NodeKind, "CUSTOM">];
+        const inputs = spec ? spec.defaultInputs : 1;
+        return {
+          ...d,
+          nodes: d.nodes.map((n) =>
+            n.id === id
+              ? {
+                  ...n,
+                  type: targetType,
+                  text: undefined,
+                  inputs,
+                  label: n.label ?? n.text?.split("\n")[0]?.slice(0, 20),
+                }
+              : n,
+          ),
+        };
+      }, "convert to component");
+    },
+    [commit],
+  );
+
   const connect = useCallback(
     (from: { node: string; port: number }, to: { node: string; port: number }) => {
       if (from.node === to.node) return;
@@ -619,7 +941,7 @@ export function useEditor(): EditorAPI {
 
   const load = useCallback(
     (d: Doc) => {
-      commit(() => ({ ...d, defs: d.defs ?? [] }), "load");
+      commit(() => ensureLayers({ ...d, defs: d.defs ?? [] }), "load");
       setSelection([]);
       setSelectedWires([]);
     },
@@ -703,9 +1025,10 @@ export function useEditor(): EditorAPI {
     [projects],
   );
 
+  const ensuredDoc = ensureRegions(ensureLayers(doc));
   return useMemo(
     () => ({
-      doc,
+      doc: ensuredDoc,
       selection,
       selectedWires,
       setSelection,
@@ -725,12 +1048,29 @@ export function useEditor(): EditorAPI {
       rotateSelected,
       nudge,
       toggleLock,
+      activeLayerId: ensuredDoc.activeLayerId,
+      layers: ensuredDoc.layers ?? [],
+      flattenLayers: !!ensuredDoc.flattenLayers,
+      setActiveLayer,
+      addLayer,
+      renameLayer,
+      removeLayer,
+      moveSelectionToLayer,
+      toggleFlattenLayers,
+      regions: ensuredDoc.regions ?? [],
+      createRegion,
+      updateRegion,
+      deleteRegion,
+      moveRegion,
       setExpected,
       copy,
       cut,
       paste,
       hasClipboard: clipRev >= 0 && !!clip.current,
       alignSelected,
+      autoLayout,
+      convertToText,
+      convertTextToComponent,
       connect,
       makeCustom,
       reset,
@@ -747,9 +1087,9 @@ export function useEditor(): EditorAPI {
       ready,
     }),
     [
-      doc, selection, selectedWires, commit, live, pushHistory, undo, redo, past, future,
-      addNode, deleteSelected, duplicateSelected, rotateSelected, nudge, toggleLock, setExpected, copy, cut, paste,
-      clipRev, alignSelected, connect, makeCustom, reset, load, metas, currentId, projects,
+      ensuredDoc, selection, selectedWires, commit, live, pushHistory, undo, redo, past, future,
+      addNode, deleteSelected, duplicateSelected, rotateSelected, nudge, toggleLock, setActiveLayer, addLayer, renameLayer, removeLayer, moveSelectionToLayer, toggleFlattenLayers, createRegion, updateRegion, deleteRegion, moveRegion, setExpected, copy, cut, paste,
+      clipRev, alignSelected, autoLayout, convertToText, convertTextToComponent, connect, makeCustom, reset, load, metas, currentId, projects,
       newFile, openFile, saveAs, renameFile, deleteFile, duplicateFile, ready,
     ],
   );
