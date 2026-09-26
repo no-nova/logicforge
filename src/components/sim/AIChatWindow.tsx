@@ -95,6 +95,11 @@ export default function AIChatWindow({ id, ed, sim, view, setView, initialNodeId
   const [aiConfig, setAIConfig] = useState<AIConfig>(() => loadAIConfig());
   const [configSaved, setConfigSaved] = useState(false);
 
+  // Settings must be automatically open every time the panel is accessed — force open on mount/id change
+  useEffect(() => {
+    setShowSettings(true);
+  }, [id]);
+
   const snapshot = useMemo(() => buildAISnapshot(ed.doc, ed.doc.defs, sim, view, ed.selection, ed.selectedWires), [ed.doc, sim, view, ed.selection, ed.selectedWires]);
   const snapshotJson = useMemo(() => formatSnapshotForPrompt(snapshot), [snapshot]);
 
@@ -337,9 +342,9 @@ export default function AIChatWindow({ id, ed, sim, view, setView, initialNodeId
         <button
           type="button"
           onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => setShowSettings((v) => !v)}
-          className={`grid h-7 w-7 place-items-center rounded-full border ${showSettings ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-fg)]" : "border-[var(--border)] bg-[var(--panel2)] text-[var(--muted)]"}`}
-          title="AI API (provider/endpoint/key/model) — directly within chat window"
+          onClick={() => setShowSettings(true)}
+          className="grid h-7 w-7 place-items-center rounded-full border border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-fg)]"
+          title="AI API (provider/endpoint/key/model) — always visible directly within chat window"
         >
           <Settings className="size-3.5" />
         </button>
@@ -403,8 +408,8 @@ export default function AIChatWindow({ id, ed, sim, view, setView, initialNodeId
       )}
 
       
-      {/* AI API — directly within chat window, not behind hidden toggle (Esc closes chat) */}
-      {showSettings ? (
+      {/* AI API — always directly within chat window, automatically open every time (no collapsed state) */}
+      {true ? (
         <div className="shrink-0 border-b border-[var(--border)] bg-[var(--panel2)]/80 p-3 text-micro">
           <div className="mb-2 flex items-center gap-2 font-bold uppercase tracking-wider text-[var(--muted)]">
             <Settings className="size-3.5" /> AI API Settings

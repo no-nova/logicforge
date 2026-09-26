@@ -33,6 +33,132 @@ export function executeAICommand(
     return hit;
   };
 
+  // === 8-bit adder / N-bit calculator intent (constrained) ===
+  // Handles "8-bit addition calculator", "8 bit adder", "8-bit adder" with possible constraints like "only uses switch, LED, OR, XOR" and "current layer"
+  const is8Bit = (lower.includes("8-bit") || lower.includes("8 bit") || lower.includes("8bit")) && (lower.includes("add") || lower.includes("calcul") || lower.includes("adder"));
+  const isConstrainedORXOR = (lower.includes("only") && lower.includes("or") && lower.includes("xor")) || (lower.includes("only uses") && lower.includes("switch") && lower.includes("led"));
+  const wantsCurrentLayer = lower.includes("current layer") || lower.includes("current") && lower.includes("layer");
+  const forbidCustom = lower.includes("custom") && (lower.includes("not allowed") || lower.includes("no custom") || lower.includes("without custom")) || lower.includes("custom components are not allowed");
+
+  if (is8Bit) {
+    // 8-bit ripple-carry adder on target layer (current layer if specified, else active/midground)
+    workflow.push({ label: "Detected 8-bit adder request", detail: prompt.slice(0, 80) });
+    let targetLayer: any = null;
+    if (lower.includes("midground") || lower.includes("mid")) targetLayer = findLayer("mid") ?? findLayer("midground");
+    else if (lower.includes("background")) targetLayer = findLayer("background");
+    else if (lower.includes("foreground") || lower.includes("fore")) targetLayer = findLayer("fore");
+    else if (wantsCurrentLayer) targetLayer = null; // use active
+    // If explicitly current layer, use active
+    const layerId: string | undefined = targetLayer?.id ?? (snapshot.view as any).activeLayerId ?? snapshot.layers[0]?.id;
+    const layerName = targetLayer?.name ?? (wantsCurrentLayer ? (snapshot.view.activeLayerName ?? "current") : (snapshot.view.activeLayerName ?? "active"));
+    workflow.push({ label: `Target layer: ${layerName}`, detail: layerId ?? "default" });
+    if (targetLayer) try { (ed as any).setActiveLayer?.(targetLayer.id); } catch {}
+    const view = snapshot.view as any;
+    const baseX0 = (400 - (view.x ?? 0)) / (view.z ?? 1);
+    const baseY0 = (300 - (view.y ?? 0)) / (view.z ?? 1);
+    let offX = 0, offY = 0;
+    if (snapshot.nodes.length) {
+      const xs = snapshot.nodes.map((n:any)=> n.x);
+      const ys = snapshot.nodes.map((n:any)=> n.y);
+      const maxX = Math.max(...xs);
+      const avgY = ys.reduce((a:number,b:number)=>a+b,0)/ys.length;
+      if (Math.max(...xs) - Math.min(...xs) > 200) {
+        offX = maxX + 180 - baseX0;
+        offY = avgY - baseY0;
+      }
+    }
+    const bx = snap(baseX0 + offX);
+    const by0 = snap(baseY0 + offY);
+    // Use only allowed types if constrained, otherwise default to allowed set anyway (switch/LED/OR/XOR) as requested
+    const useOnlyORXOR = true; // for 8-bit calculator, always respect "only switch, LED, OR, XOR" — don't use AND/ADDER
+    workflow.push({ label: `Building 8-bit adder`, detail: useOnlyORXOR ? "16×INPUT(switch) + 9×LED + 56×XOR/OR (AND via OR+XOR)" : "using ADDER" });
+    try {
+      const lid = layerId;
+      const mk = (type: string, x:number, y:number, label?:string): any => ({
+        id: uid((type.toLowerCase().slice(0,3)+"_")),
+        type: type as any,
+        x: snap(x), y: snap(y), rot: 0 as const,
+        inputs: ((): number => { const s=(CATALOG as any)[type]; return s? s.defaultInputs : (type==="INPUT"?0:type==="LED"?1:2); })(),
+        label, layerId: lid,
+        ...(type==="INPUT"?{value:0}:{}),
+        delay: (CATALOG as any)[type]?.defaultDelay ?? 1,
+      });
+      const newNodes: any[] = [];
+      const newWires: any[] = [];
+      const w = (from:string, fp:number, to:string, tp:number) => ({ id: uid("w"), from:{node:from,port:fp}, to:{node:to,port:tp} });
+      // Create Cin0 switch for LSB
+      const cin0 = mk("INPUT", bx - 340, by0 - 320, "Cin0");
+      cin0.label = "Cin0";
+      newNodes.push(cin0);
+      // For each bit 0..7
+      const bitCoutOrIds: string[] = [];
+      const bitSumXorIds: string[] = [];
+      for (let i=0;i<8;i++) {
+        const y = by0 + i*90 - 315; // centered vertical stack
+        const xBase = bx - 80; // center of gates for this bit
+        // Inputs A_i, B_i
+        const a = mk("INPUT", bx - 280, y, `A${i}`);
+        a.label = `A${i}`;
+        const b = mk("INPUT", bx - 280, y+30, `B${i}`);
+        b.label = `B${i}`;
+        newNodes.push(a,b);
+        // Gates for this bit (7 gates)
+        const xor_ab = mk("XOR", xBase - 40, y+5);
+        const or_ab = mk("OR", xBase - 40, y+35);
+        const and1_xor = mk("XOR", xBase + 40, y+15); // AND via XOR(OR,XOR)
+        const xor_c = mk("XOR", xBase + 120, y+5); // also Sum
+        const or_c = mk("OR", xBase + 120, y+35);
+        const and2_xor = mk("XOR", xBase + 200, y+15);
+        const cout_or = mk("OR", xBase + 280, y+15);
+        // LED for sum
+        const sumLed = mk("LED", bx + 380, y+15, `S${i}`);
+        sumLed.label = `S${i}`;
+        newNodes.push(xor_ab, or_ab, and1_xor, xor_c, or_c, and2_xor, cout_or, sumLed);
+        // Wires for this bit's internal logic (except Cin which may be from previous)
+        // A->xor_ab, A->or_ab, B->xor_ab, B->or_ab
+        newWires.push(w(a.id,0,xor_ab.id,0));
+        newWires.push(w(a.id,0,or_ab.id,0));
+        newWires.push(w(b.id,0,xor_ab.id,1));
+        newWires.push(w(b.id,0,or_ab.id,1));
+        // xor_ab & or_ab -> and1_xor (AND1)
+        newWires.push(w(xor_ab.id,0,and1_xor.id,0));
+        newWires.push(w(or_ab.id,0,and1_xor.id,1));
+        // xor_ab and Cin -> xor_c and or_c
+        // Cin source: for i=0, cin0; for i>0, previous cout_or
+        const cinSourceId = i===0 ? cin0.id : bitCoutOrIds[i-1];
+        newWires.push(w(xor_ab.id,0,xor_c.id,0));
+        newWires.push(w(cinSourceId,0,xor_c.id,1));
+        newWires.push(w(xor_ab.id,0,or_c.id,0));
+        newWires.push(w(cinSourceId,0,or_c.id,1));
+        // or_c & xor_c -> and2_xor
+        newWires.push(w(or_c.id,0,and2_xor.id,0));
+        newWires.push(w(xor_c.id,0,and2_xor.id,1));
+        // and1 & and2 -> cout_or
+        newWires.push(w(and1_xor.id,0,cout_or.id,0));
+        newWires.push(w(and2_xor.id,0,cout_or.id,1));
+        // xor_c -> sum LED
+        newWires.push(w(xor_c.id,0,sumLed.id,0));
+        // remember for next iteration
+        bitCoutOrIds.push(cout_or.id);
+        bitSumXorIds.push(xor_c.id);
+      }
+      // Final Cout LED from last cout_or
+      const finalCout = mk("LED", bx + 380, by0 + 7*90 -315 + 45, "Cout");
+      finalCout.label = "Cout";
+      newNodes.push(finalCout);
+      newWires.push(w(bitCoutOrIds[7],0,finalCout.id,0));
+
+      ed.commit((d:any)=> ({ ...d, nodes: [...d.nodes, ...newNodes], wires: [...d.wires, ...newWires] }), "AI: create 8-bit adder (OR/XOR only) in "+layerName);
+      setTimeout(()=> { try { ed.setSelection(newNodes.map((n:any)=>n.id)); if (layerId) (ed as any).setActiveLayer?.(layerId); } catch {} }, 20);
+      actions.push(`create 8-bit adder (16 switches +9 LEDs +56 gates) in ${layerName} at (${bx},${by0})`);
+      workflow.push({ label: `Placed ${newNodes.length} components`, detail: `16×INPUT, 9×LED, 32×XOR, 24×OR` });
+      workflow.push({ label: `Wired ${newWires.length} connections`, detail: "ripple-carry, AND via OR+XOR" });
+      return say(`✅ Created **8-bit addition calculator** in **${layerName}** at (${bx}, ${by0}) — **only** \`switch\` (INPUT), \`LED\`, \`OR\`, \`XOR\` (no custom, no AND/ADDER). 16 switches (A0-7, B0-7 + Cin0), 8 sum LEDs (S0-7) + Cout LED, 56 gates (4×XOR +3×OR per bit with AND synthesized as \`XOR(OR,XOR)\`). Ripple-carry fully wired (${newWires.length} wires). Layer: ${layerName}. Toggle A/B to test — e.g., A=00000011 + B=00000001 → S=00000100, Cout=0.`);
+    } catch (e:any) {
+      return { success:false, message: `Failed to create 8-bit adder: ${e?.message ?? String(e)}`, actions, workflow };
+    }
+  }
+
   // === Full adder intent (handles "make/build/create/generate full adder in midground") ===
   if (lower.includes("full adder") || (lower.includes("full-adder")) || (lower.includes("adder") && (lower.includes("make") || lower.includes("build") || lower.includes("create") || lower.includes("generate") || lower.includes("full")))) {
     workflow.push({ label: "Detected full adder request", detail: prompt.slice(0, 80) });
@@ -50,7 +176,9 @@ export function executeAICommand(
     workflow.push({ label: `Target layer: ${layerName}`, detail: layerId ?? "default" });
 
     // Decide construction mode: if user says "from gates" or wants explicit gates, build gate-level; otherwise use ADDER primitive + IO
-    const wantsGates = lower.includes("gate") || lower.includes("xor") || lower.includes("from scratch");
+    // If prompt says "only uses switch, LED, OR, XOR" or "only OR and XOR" etc., force constrained OR/XOR synthesis (no AND/ADDER, no custom)
+    const constrainedORXOR = (lower.includes("only") && lower.includes("or") && lower.includes("xor")) || (lower.includes("only uses") && lower.includes("switch") && lower.includes("led")) || lower.includes("only uses switch, led, or, and xor");
+    const wantsGates = constrainedORXOR || lower.includes("gate") || lower.includes("xor") || lower.includes("from scratch");
     // Activate target layer first (so UI reflects)
     if (targetLayer) {
       try { (ed as any).setActiveLayer?.(targetLayer.id); } catch {}
@@ -79,6 +207,58 @@ export function executeAICommand(
 
     try {
       if (wantsGates) {
+        if (constrainedORXOR) {
+          // Constrained: only switch(INPUT), LED, OR, XOR — synthesize AND via XOR(OR,XOR), use LED for outputs
+          workflow.push({ label: "Building constrained full adder", detail: "only OR/XOR + switch/LED (AND via XOR(OR,XOR))" });
+          const lid = layerId;
+          const mk = (type: string, x:number, y:number, extra:any={}): any => ({
+            id: uid((type.toLowerCase().slice(0,3)+"_")),
+            type: type as any,
+            x: snap(x),
+            y: snap(y),
+            rot: 0 as const,
+            inputs: ((): number => { const spec = (CATALOG as any)[type]; return spec ? spec.defaultInputs : (type==="INPUT"?0:type==="LED"?1:2); })(),
+            label: extra.label,
+            layerId: lid,
+            ...(type==="INPUT" ? { value: 0 } : {}),
+            delay: (CATALOG as any)[type]?.defaultDelay ?? 1,
+          });
+          const nA = mk("INPUT", bx - 220, by - 60, { label: "A" });
+          const nB = mk("INPUT", bx - 220, by + 20, { label: "B" });
+          const nCin = mk("INPUT", bx - 220, by + 100, { label: "Cin" });
+          // AND via OR+XOR: and = XOR(OR(a,b), XOR(a,b))
+          const xor_ab = mk("XOR", bx - 40, by - 20);
+          const or_ab = mk("OR", bx - 40, by + 10);
+          const and1 = mk("XOR", bx + 40, by - 5); // will be XOR(or_ab, xor_ab) = A&B
+          const xor_c = mk("XOR", bx + 120, by - 0); // also Sum = xor_ab xor Cin
+          const or_c = mk("OR", bx + 120, by + 30);
+          const and2 = mk("XOR", bx + 200, by - 5); // = (xor_ab & Cin)
+          const or_out = mk("OR", bx + 280, by + 15); // Cout = and1 or and2
+          const outS = mk("LED", bx + 400, by + 0, { label: "Sum" });
+          const outCout = mk("LED", bx + 400, by + 60, { label: "Cout" });
+          nA.label="A"; nB.label="B"; nCin.label="Cin"; outS.label="Sum"; outCout.label="Cout";
+          const newNodes = [nA,nB,nCin,xor_ab,or_ab,and1,xor_c,or_c,and2,or_out,outS,outCout];
+          const w = (from:string, fp:number, to:string, tp:number) => ({ id: uid("w"), from: { node: from, port: fp }, to: { node: to, port: tp } });
+          const newWires = [
+            w(nA.id,0,xor_ab.id,0), w(nA.id,0,or_ab.id,0),
+            w(nB.id,0,xor_ab.id,1), w(nB.id,0,or_ab.id,1),
+            w(xor_ab.id,0,and1.id,0), w(or_ab.id,0,and1.id,1),
+            w(xor_ab.id,0,xor_c.id,0), w(nCin.id,0,xor_c.id,1),
+            w(xor_ab.id,0,or_c.id,0), w(nCin.id,0,or_c.id,1),
+            w(or_c.id,0,and2.id,0), w(xor_c.id,0,and2.id,1),
+            w(and1.id,0,or_out.id,0), w(and2.id,0,or_out.id,1),
+            w(xor_c.id,0,outS.id,0), w(or_out.id,0,outCout.id,0),
+          ];
+          ed.commit((d:any)=> {
+            const ens = d.layers ? d : { ...d, layers: snapshot.layers as any, activeLayerId: layerId };
+            return { ...ens, nodes: [...ens.nodes, ...newNodes], wires: [...ens.wires, ...newWires] };
+          }, "AI: create constrained full adder in "+layerName);
+          setTimeout(()=> { try { ed.setSelection(newNodes.map(n=>n.id)); (ed as any).setActiveLayer?.(layerId); } catch {} }, 20);
+          actions.push(`create constrained full adder (only OR/XOR) in ${layerName} at (${bx},${by})`);
+          workflow.push({ label: "Placed 12 components", detail: newNodes.map(n=>n.type).join(", ") });
+          workflow.push({ label: "Wired 16 connections", detail: "AND via XOR(OR,XOR), no custom" });
+          return say(`✅ Created **full adder (constrained)** in **${layerName}** at (${bx}, ${by}) — **only** \`switch\` (INPUT), \`LED\`, \`OR\`, \`XOR\` (no AND, no custom, no ADDER). 3 switches (A,B,Cin) + 2 LEDs (Sum, Cout) + 4×XOR +3×OR = 12 components, 16 wires with AND synthesized as \`XOR(OR,XOR)\`. Active layer: ${layerName}. Toggle A/B/Cin to test!`);
+        }
         // Gate-level full adder: 3 INPUT + 2 XOR + 2 AND + 1 OR + 2 OUTPUT = 10 nodes, 12 wires
         workflow.push({ label: "Building gate-level full adder", detail: "2×XOR + 2×AND + 1×OR + 3 IN + 2 OUT" });
         const lid = layerId;
