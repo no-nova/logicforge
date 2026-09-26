@@ -3,7 +3,7 @@
  * Standard interface for AI to understand coordinates, type, connections, on/off, selection, layers, groups.
  */
 import type { CNode, Doc } from "./types";
-import { portCounts, nodeTitle, specOf } from "./catalog";
+import { portCounts, nodeTitle, specOf, CATALOG } from "./catalog";
 import { getNodeSize, getPortPosition } from "./geometry";
 import type { SimResult, Val } from "./types";
 import { inKey, outKey } from "./netlist";
@@ -74,6 +74,21 @@ export interface AIWireSnapshot {
   transitionTick?: number;
 }
 
+export interface AIComponentSize {
+  type: string;
+  name: string;
+  w: number;
+  h: number;
+  group: string;
+  minW: number;
+  maxW: number;
+  minH: number;
+  maxH: number;
+  // how many rows (ins/outs) this size corresponds to
+  exampleInputs: number;
+  exampleOutputs: number;
+}
+
 export interface AISnapshot {
   meta: {
     name: string;
@@ -83,6 +98,16 @@ export interface AISnapshot {
     layerCount: number;
     regionCount: number;
     customDefCount: number;
+  };
+  catalogSizes: AIComponentSize[];
+  grid: { size: number; snap: string };
+  placementHints: {
+    /** Where AI should place next components to avoid overlap (empty area) */
+    nextFreeOrigin: { x: number; y: number };
+    /** Bounding box of existing nodes */
+    boundingBox: { x1: number; y1: number; x2: number; y2: number } | null;
+    /** Current layer id where AI should place if prompt says "current layer" */
+    currentLayerId?: string;
   };
   view: {
     x: number;
@@ -154,6 +179,74 @@ export function buildAISnapshot(
   }
 
   const layerById = new Map<string, any>(sortedLayers.map((l: any) => [l.id, l]));
+
+  // Build catalog size disclosure for AI (prevents overlapping auto-layout)
+  const catalogSizes: AIComponentSize[] = [];
+  try {
+    for (const [type, spec] of Object.entries(CATALOG as any)) {
+      const dummy: any = { type, inputs: (spec as any).defaultInputs ?? (spec as any).minIn ?? 2, text: "Note", label: type };
+      const { w, h } = getNodeSize(dummy as any, defs);
+      // For variable fanin, also compute max
+      let maxW = w, maxH = h;
+      if ((spec as any).variableFanin) {
+        const maxDummy: any = { type, inputs: (spec as any).maxIn ?? 8, text: "Note", label: type };
+        const mh = getNodeSize(maxDummy as any, defs);
+        maxW = mh.w; maxH = mh.h;
+      }
+      let minW = w, minH = Math.max(40, h - 40);
+      if ((spec as any).minIn !== undefined) {
+        const minDummy: any = { type, inputs: (spec as any).minIn, text: "N", label: type };
+        const mn = getNodeSize(minDummy as any, defs);
+        minW = mn.w; minH = mn.h;
+      }
+      // For TEXT, show range
+      if (type === "TEXT") { minW = 120; maxW = 320; minH = 48; maxH = 120; }
+      if (type === "INPUT" || type === "LED") { minW = maxW = w; minH = maxH = h; }
+      catalogSizes.push({
+        type,
+        name: (spec as any).name ?? type,
+        w, h,
+        group: (spec as any).group ?? "unknown",
+        minW, maxW, minH, maxH,
+        exampleInputs: dummy.inputs,
+        exampleOutputs: ((spec as any).outs?.(dummy)?.length ?? 1),
+      });
+    }
+    // Add CUSTOM placeholder
+    catalogSizes.push({ type: "CUSTOM", name: "BLOCK", w: 92, h: 50, group: "custom", minW: 92, maxW: 140, minH: 50, maxH: 90, exampleInputs: 2, exampleOutputs: 1 });
+  } catch {}
+
+  // Compute placement hints for AI to avoid overlapping
+  let boundingBox: { x1: number; y1: number; x2: number; y2: number } | null = null;
+  let nextFreeOrigin = { x: 120, y: 120 };
+  try {
+    if (doc.nodes.length) {
+      let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+      for (const n of doc.nodes) {
+        const { w, h } = getNodeSize(n as any, defs);
+        x1 = Math.min(x1, n.x);
+        y1 = Math.min(y1, n.y);
+        x2 = Math.max(x2, n.x + w);
+        y2 = Math.max(y2, n.y + h);
+      }
+      boundingBox = { x1, y1, x2, y2 };
+      // Place next circuit to the right of existing with 180px gap, or at view center if empty area
+      const gap = 180;
+      const viewCx = view ? (400 - view.x) / view.z : x2 + gap;
+      const viewCy = view ? (300 - view.y) / view.z : y1;
+      // Prefer right of existing, but if that would be off-view, use gap from maxX
+      nextFreeOrigin = { x: Math.max(x2 + gap, Math.round(viewCx)), y: Math.round(Math.min(y1, viewCy)) };
+      // Snap to grid
+
+      // snap already applied
+      nextFreeOrigin.x = Math.round(nextFreeOrigin.x / 20) * 20;
+      nextFreeOrigin.y = Math.round(nextFreeOrigin.y / 20) * 20;
+    } else if (view) {
+      nextFreeOrigin = { x: Math.round((400 - view.x)/view.z), y: Math.round((300 - view.y)/view.z) };
+      nextFreeOrigin.x = Math.round(nextFreeOrigin.x/20)*20;
+      nextFreeOrigin.y = Math.round(nextFreeOrigin.y/20)*20;
+    }
+  } catch {}
 
   const nodes: AINodeSnapshot[] = doc.nodes.map((n) => {
     const { w, h } = getNodeSize(n, defs);
@@ -310,6 +403,13 @@ export function buildAISnapshot(
       regionCount: regions.length,
       customDefCount: defs.length,
     },
+    catalogSizes,
+    grid: { size: 20, snap: "snapToGrid(x)=Math.round(x/20)*20 — all x/y are multiples of 20" },
+    placementHints: {
+      nextFreeOrigin,
+      boundingBox,
+      currentLayerId: activeLayerId,
+    },
     view: {
       x: view?.x ?? 0,
       y: view?.y ?? 0,
@@ -349,6 +449,7 @@ export function buildAISnapshot(
 
 /** Expose snapshot to AI via global and fetchable JSON. */
 export function formatSnapshotForPrompt(snapshot: AISnapshot): string {
-  // Compact but complete for LLM context
-  return JSON.stringify(snapshot, null, 2);
+  // Compact but complete for LLM context — include explicit size guidance for AI auto-layout
+  const header = `// LogicForge AI disclosure — includes per-node w/h and catalogSizes (w/h ranges per type) + grid=20 + placementHints.nextFreeOrigin (use for new components to avoid overlap; respect currentLayerId if prompt says "current layer").\\n`;
+  return header + JSON.stringify(snapshot, null, 2);
 }

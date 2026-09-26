@@ -54,21 +54,47 @@ export function executeAICommand(
     workflow.push({ label: `Target layer: ${layerName}`, detail: layerId ?? "default" });
     if (targetLayer) try { (ed as any).setActiveLayer?.(targetLayer.id); } catch {}
     const view = snapshot.view as any;
-    const baseX0 = (400 - (view.x ?? 0)) / (view.z ?? 1);
-    const baseY0 = (300 - (view.y ?? 0)) / (view.z ?? 1);
-    let offX = 0, offY = 0;
-    if (snapshot.nodes.length) {
-      const xs = snapshot.nodes.map((n:any)=> n.x);
-      const ys = snapshot.nodes.map((n:any)=> n.y);
-      const maxX = Math.max(...xs);
-      const avgY = ys.reduce((a:number,b:number)=>a+b,0)/ys.length;
-      if (Math.max(...xs) - Math.min(...xs) > 200) {
-        offX = maxX + 180 - baseX0;
-        offY = avgY - baseY0;
+    // AI disclosure now includes catalogSizes (w/h per type) and placementHints.nextFreeOrigin to avoid overlap
+    // Use size-aware placement: each component is 80×50 typical (see catalogSizes), grid=20, vertical step 90 = h + gap
+    let bx: number, by0: number;
+    try {
+      const ph: any = (snapshot as any).placementHints;
+      const cs: any[] = (snapshot as any).catalogSizes ?? [];
+      // Prefer disclosure-provided free origin (computed with getNodeSize) — ensures no overlap
+      if (ph?.nextFreeOrigin) {
+        bx = snap(ph.nextFreeOrigin.x);
+        by0 = snap(ph.nextFreeOrigin.y);
+        // If that would still overlap (e.g., after manual move), shift right of bounding box
+        const bb = ph.boundingBox;
+        if (bb && bx < bb.x2 + 80) {
+          bx = snap(bb.x2 + 180);
+        }
+      } else {
+        const baseX0 = (400 - (view.x ?? 0)) / (view.z ?? 1);
+        const baseY0 = (300 - (view.y ?? 0)) / (view.z ?? 1);
+        let offX = 0, offY = 0;
+        if (snapshot.nodes.length) {
+          const xs = snapshot.nodes.map((n:any)=> n.x);
+          const ys = snapshot.nodes.map((n:any)=> n.y);
+          const maxX = Math.max(...xs);
+          const avgY = ys.reduce((a:number,b:number)=>a+b,0)/ys.length;
+          if (Math.max(...xs) - Math.min(...xs) > 200) {
+            offX = maxX + 180 - baseX0;
+            offY = avgY - baseY0;
+          }
+        }
+        bx = snap(baseX0 + offX);
+        by0 = snap(baseY0 + offY);
       }
+      // Log sizes to workflow for debuggability
+      const xorSize = (cs.find((c:any)=> c.type==="XOR")?.w ?? 80);
+      workflow.push({ label: `Placement origin (${bx},${by0})`, detail: `grid20, xorW=${xorSize}, gap90, catalogSizes exposed` });
+    } catch {
+      const baseX0 = (400 - (view.x ?? 0)) / (view.z ?? 1);
+      const baseY0 = (300 - (view.y ?? 0)) / (view.z ?? 1);
+      bx = snap(baseX0);
+      by0 = snap(baseY0);
     }
-    const bx = snap(baseX0 + offX);
-    const by0 = snap(baseY0 + offY);
     // Use only allowed types if constrained, otherwise default to allowed set anyway (switch/LED/OR/XOR) as requested
     const useOnlyORXOR = true; // for 8-bit calculator, always respect "only switch, LED, OR, XOR" — don't use AND/ADDER
     workflow.push({ label: `Building 8-bit adder`, detail: useOnlyORXOR ? "16×INPUT(switch) + 9×LED + 56×XOR/OR (AND via OR+XOR)" : "using ADDER" });
@@ -183,27 +209,42 @@ export function executeAICommand(
     if (targetLayer) {
       try { (ed as any).setActiveLayer?.(targetLayer.id); } catch {}
     }
-    // Compute base position at view center
+    // Size-aware placement using catalogSizes + placementHints (grid20) to avoid overlapping
     const view = snapshot.view as any;
-    const baseX = (400 - (view.x ?? 0)) / (view.z ?? 1);
-    const baseY = (300 - (view.y ?? 0)) / (view.z ?? 1);
-    // Avoid overlapping existing nodes: offset by existing bounds
-    let offsetX = 0;
-    let offsetY = 0;
-    if (snapshot.nodes.length) {
-      const xs = snapshot.nodes.map((n:any)=> n.x);
-      const ys = snapshot.nodes.map((n:any)=> n.y);
-      const minX = Math.min(...xs);
-      const maxX = Math.max(...xs);
-      const avgY = ys.reduce((a:number,b:number)=>a+b,0)/ys.length;
-      // Place adder to the right of existing circuit if possible
-      if (maxX - minX > 200) {
-        offsetX = maxX + 120 - baseX;
-        offsetY = avgY - baseY;
+    let bx: number, by: number;
+    try {
+      const ph: any = (snapshot as any).placementHints;
+      const cs: any[] = (snapshot as any).catalogSizes ?? [];
+      if (ph?.nextFreeOrigin) {
+        bx = snap(ph.nextFreeOrigin.x);
+        by = snap(ph.nextFreeOrigin.y);
+        const bb = ph.boundingBox;
+        if (bb && bx < bb.x2 + 80) bx = snap(bb.x2 + 140);
+        const wInfo = cs.find((c:any)=> c.type==="XOR");
+        workflow.push({ label: `Placement (${bx},${by})`, detail: `grid20, catalogSizes ready, w=${wInfo?.w ?? 80}` });
+      } else {
+        const baseX = (400 - (view.x ?? 0)) / (view.z ?? 1);
+        const baseY = (300 - (view.y ?? 0)) / (view.z ?? 1);
+        let offsetX = 0, offsetY = 0;
+        if (snapshot.nodes.length) {
+          const xs = snapshot.nodes.map((n:any)=> n.x);
+          const ys = snapshot.nodes.map((n:any)=> n.y);
+          const minX = Math.min(...xs);
+          const maxX = Math.max(...xs);
+          const avgY = ys.reduce((a:number,b:number)=>a+b,0)/ys.length;
+          if (maxX - minX > 200) {
+            offsetX = maxX + 120 - baseX;
+            offsetY = avgY - baseY;
+          }
+        }
+        bx = snap(baseX + offsetX);
+        by = snap(baseY + offsetY);
       }
+    } catch {
+      const baseX = (400 - (view.x ?? 0)) / (view.z ?? 1);
+      const baseY = (300 - (view.y ?? 0)) / (view.z ?? 1);
+      bx = snap(baseX); by = snap(baseY);
     }
-    const bx = snap(baseX + offsetX);
-    const by = snap(baseY + offsetY);
 
     try {
       if (wantsGates) {
@@ -418,8 +459,13 @@ export function executeAICommand(
     if (!found) found = "AND";
     workflow.push({ label: `Adding ${found} gate to canvas`, detail: `Type: ${found}` });
     try {
-      const cx = snapshot.view.x + 400 / snapshot.view.z;
-      const cy = snapshot.view.y + 250 / snapshot.view.z;
+      // Prefer placementHints for overlap avoidance, grid=20, use catalogSizes for spacing if needed
+      let cx: number, cy: number;
+      try {
+        const ph2: any = (snapshot as any).placementHints;
+        if (ph2?.nextFreeOrigin) { cx = ph2.nextFreeOrigin.x; cy = ph2.nextFreeOrigin.y; }
+        else { cx = snapshot.view.x + 400 / snapshot.view.z; cy = snapshot.view.y + 250 / snapshot.view.z; }
+      } catch { cx = snapshot.view.x + 400 / snapshot.view.z; cy = snapshot.view.y + 250 / snapshot.view.z; }
       const id = ed.addNode(found as any, cx, cy);
       actions.push(`addNode(${found}, ${cx}, ${cy}) -> ${id}`);
       return say(`Added ${found} component (${id}) near center of view. It is now selected. You can move it or connect it next.`);

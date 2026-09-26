@@ -342,8 +342,8 @@ export default function AIChatWindow({ id, ed, sim, view, setView, initialNodeId
         <button
           type="button"
           onPointerDown={(e) => e.stopPropagation()}
-          onClick={() => setShowSettings(true)}
-          className="grid h-7 w-7 place-items-center rounded-full border border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-fg)]"
+          onClick={() => setShowSettings((v)=> !v)}
+          className={`grid h-7 w-7 place-items-center rounded-full border ${showSettings ? "border-[var(--accent)] bg-[var(--accent)] text-[var(--accent-fg)]" : "border-[var(--border)] bg-[var(--panel2)] text-[var(--muted)]"}`}
           title="AI API (provider/endpoint/key/model) — always visible directly within chat window"
         >
           <Settings className="size-3.5" />
@@ -408,8 +408,8 @@ export default function AIChatWindow({ id, ed, sim, view, setView, initialNodeId
       )}
 
       
-      {/* AI API — always directly within chat window, automatically open every time (no collapsed state) */}
-      {true ? (
+      {/* AI API — auto-open on each chat (useEffect id→true) but closable via gear toggle */}
+      {showSettings ? (
         <div className="shrink-0 border-b border-[var(--border)] bg-[var(--panel2)]/80 p-3 text-micro">
           <div className="mb-2 flex items-center gap-2 font-bold uppercase tracking-wider text-[var(--muted)]">
             <Settings className="size-3.5" /> AI API Settings

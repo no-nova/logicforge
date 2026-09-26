@@ -377,6 +377,7 @@ export default function AppShell() {
         api.setSelectedWires([]);
         setHelp(false);
         setFilesOpen(false);
+        if (aiWindows.length) setAiWindows([]);
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
         api.nudge(e.shiftKey ? -GRID * 5 : -GRID, 0);
@@ -529,6 +530,7 @@ export default function AppShell() {
               onCursor={setCursor}
               fit={fit}
               onOpenAI={openAIChat}
+              onCloseAI={() => { /* left-click empty canvas closes AI like Esc */ if (aiWindows.length) setAiWindows([]); }}
             />
           )}
           <div className="pointer-events-none absolute left-3 top-3 flex flex-wrap gap-1.5 text-micro">

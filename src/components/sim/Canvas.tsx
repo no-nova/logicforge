@@ -68,6 +68,7 @@ interface Props {
   onCursor: (p: { x: number; y: number } | null) => void;
   fit: () => void;
   onOpenAI?: (nodeId?: string) => void;
+  onCloseAI?: () => void;
 }
 
 type Drag =
@@ -116,12 +117,24 @@ function getRegionExternalPorts(region: Region, doc: { nodes: CNode[]; wires: { 
 }
 
 export default function Canvas(props: Props) {
-  const { ed, sim, view, setView, startInertia, stopInertia, running, wireStyle, snapOn, wheelZoom, spacePan, reduceGlow, glossy, onToggleSwitch, onCursor, fit, onOpenAI } = props;
+  const { ed, sim, view, setView, startInertia, stopInertia, running, wireStyle, snapOn, wheelZoom, spacePan, reduceGlow, glossy, onToggleSwitch, onCursor, fit, onOpenAI, onCloseAI } = props;
   const { doc, selection, selectedWires } = ed;
   const defs = doc.defs;
   const ref = useRef<HTMLDivElement>(null);
   const [drag, setDrag] = useState<Drag>(null);
   const dragRef = useRef<Drag>(null);
+  // Performance: flag when user is actively panning/zooming — disable expensive blur/filters during interaction for smoothness
+  const [isInteracting, setIsInteracting] = useState(false);
+  const interactingTimeout = useRef<number | null>(null);
+  const setInteracting = (v: boolean) => {
+    if (v) {
+      if (interactingTimeout.current) window.clearTimeout(interactingTimeout.current);
+      setIsInteracting(true);
+    } else {
+      if (interactingTimeout.current) window.clearTimeout(interactingTimeout.current);
+      interactingTimeout.current = window.setTimeout(()=> setIsInteracting(false), 140) as any;
+    }
+  };
   dragRef.current = drag;
   const [guides, setGuides] = useState<{ v: number[]; h: number[] }>({ v: [], h: [] });
   const [hoverPort, setHoverPort] = useState<string | null>(null);
@@ -232,6 +245,7 @@ export default function Canvas(props: Props) {
   const rightPanRef = useRef(false);
   const rightSelectStart = useRef<{ x: number; y: number } | null>(null);
   const pendingMarqueeRef = useRef<{ sx: number; sy: number; cx: number; cy: number } | null>(null);
+  const leftMarqueeRef = useRef(false); // true if current marquee was left-click selection (no Region)
   const selectionRef = useRef<string[]>([]);
   // keep selection fresh for menu actions
   useEffect(()=>{ selectionRef.current = selection; }, [selection]);
@@ -239,6 +253,28 @@ export default function Canvas(props: Props) {
   const pendingRegionDrag = useRef<{ id: string; sx: number; sy: number; ox: number; oy: number; nodeStarts: Map<string,{x:number;y:number}> } | null>(null);
   const viewRef = useRef(view);
   viewRef.current = view;
+  // Throttled view setter for smooth pan/zoom — batches rapid setView calls into rAF (60fps) to reduce re-render lag
+  const pendingView = useRef<View | null>(null);
+  const rafView = useRef<number>(0);
+  const setViewThrottled = (u: View | ((v: View)=>View)) => {
+    const next = typeof u === 'function' ? (u as any)(viewRef.current) : u;
+    pendingView.current = next;
+    if (rafView.current) return;
+    rafView.current = requestAnimationFrame(()=> {
+      rafView.current = 0;
+      const v = pendingView.current;
+      pendingView.current = null;
+      if (v) setView(v);
+    });
+  };
+  // During active drag/zoom use throttled, otherwise immediate
+  const setViewSmart = (u: View | ((v: View)=>View)) => {
+    if (isInteracting || dragRef.current?.kind==='pan' || dragRef.current?.kind==='pinch') {
+      setViewThrottled(u);
+    } else {
+      setView(u);
+    }
+  };
 
   const layers = (ed as any).layers ?? [];
   const activeLayerId = (ed as any).activeLayerId as string | undefined;
@@ -312,7 +348,8 @@ export default function Canvas(props: Props) {
       const dy = clamp(e.deltaY * unit, 400);
       // pinch or wheel zoom
       const newZ = viewRef.current.z * Math.exp(-dy * 0.0018);
-      setView((v) => zoomToward(v, mx, my, newZ));
+      (isInteracting ? setViewThrottled : setView)((v) => zoomToward(v, mx, my, newZ));
+      setInteracting(true);
     };
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => el.removeEventListener("wheel", onWheel);
@@ -443,7 +480,8 @@ export default function Canvas(props: Props) {
       });
       return;
     }
-    // Left button: click on empty canvas clears selection, drag pans
+    // Left button: left-click selection (temporary, no Region) — drag selects, click clears + closes AI (like Esc)
+    // Renamed from left-drag pan — pan now via middle/Alt/Space only; left is selection only
     if (e.button === 0) {
       e.preventDefault();
       if (mapExpanded) {
@@ -452,14 +490,10 @@ export default function Canvas(props: Props) {
         return;
       }
       infoBlockUntil.current = Date.now() + 10000;
-      // Store pending pan to distinguish click vs drag — capture immediately so moves outside still track
-      (beginPan as any)._pendingLeft = { x: e.clientX, y: e.clientY, ox: view.x, oy: view.y };
+      const startWorld = toWorld(e.clientX, e.clientY);
+      (beginPan as any)._pendingLeftMarquee = { sx: startWorld.x, sy: startWorld.y, cx: e.clientX, cy: e.clientY };
+      leftMarqueeRef.current = false;
       try { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId); } catch {}
-      // Long-press fallback: if held without movement, still allow tiny nudge to start pan (helps touchpads)
-      if ((beginPan as any)._longLeftTimer) window.clearTimeout((beginPan as any)._longLeftTimer);
-      (beginPan as any)._longLeftTimer = window.setTimeout(() => {
-        // keep pending, don't auto-start pan, just ensure it doesn't get cleared prematurely
-      }, 400);
       return;
     }
     if (e.button === 1 || e.altKey || spacePan || e.buttons === 4) {
@@ -483,6 +517,7 @@ export default function Canvas(props: Props) {
       rightLongPressTimer.current = window.setTimeout(()=> {
         if (pendingMarqueeRef.current) {
           rightPanRef.current = true;
+          leftMarqueeRef.current = false;
           swipeRef.current = { y: startClientY, active: activeLayerId };
           if (!e.shiftKey) {
             ed.setSelection([]);
@@ -525,37 +560,25 @@ export default function Canvas(props: Props) {
         if (dx || dy) {
           // Only auto-move if hovering over empty map area (not over node/port) - check via rawHover null and no selection drag
           if (!rawHover) {
-            setView((v)=> ({ ...v, x: v.x + dx*1.2, y: v.y + dy*1.2 }));
+            setViewThrottled((v)=> ({ ...v, x: v.x + dx*1.2, y: v.y + dy*1.2 }));
+            setInteracting(true);
           }
         }
       }
     }
-    // Pending left pan: start on movement >2px — capture already at down, use origin for smooth delta
-    if ((beginPan as any)._pendingLeft) {
-      const pend = (beginPan as any)._pendingLeft as { x: number; y: number; ox: number; oy: number };
-      const dist = Math.hypot(e.clientX - pend.x, e.clientY - pend.y);
-      if (dist > 2) {
-        (beginPan as any)._pendingLeft = null;
-        if ((beginPan as any)._longLeftTimer) { window.clearTimeout((beginPan as any)._longLeftTimer); (beginPan as any)._longLeftTimer = null; }
-        // Start pan now — sx/sy is origin so delta = current - origin, immediate visual feedback
-        stopInertia();
+    // Pending left-click selection: drag selects components (temporary, no Region creation) — like right but no divide
+    if ((beginPan as any)._pendingLeftMarquee) {
+      const pm = (beginPan as any)._pendingLeftMarquee as { sx: number; sy: number; cx: number; cy: number };
+      if (Math.hypot(e.clientX - pm.cx, e.clientY - pm.cy) > 4) {
+        (beginPan as any)._pendingLeftMarquee = null;
+        leftMarqueeRef.current = true;
+        if (!e.shiftKey) {
+          ed.setSelection([]);
+          ed.setSelectedWires([]);
+        }
         try { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId); } catch {}
-        const pdrag = {
-          kind: "pan",
-          sx: pend.x,
-          sy: pend.y,
-          ox: pend.ox,
-          oy: pend.oy,
-          lastX: e.clientX,
-          lastY: e.clientY,
-          lastT: performance.now(),
-          vx: 0,
-          vy: 0,
-        } as Drag;
-        dragRef.current = pdrag;
-        setDrag(pdrag);
-        // Apply pan immediately for this move (otherwise needs 2 moves to see displacement)
-        setView({ x: pend.ox + (e.clientX - pend.x), y: pend.oy + (e.clientY - pend.y), z: viewRef.current.z });
+        swipeRef.current = { y: pm.cy, active: activeLayerId };
+        setDrag({ kind: "marquee", sx: pm.sx, sy: pm.sy, x: p.x, y: p.y });
         return;
       }
     }
@@ -566,6 +589,7 @@ export default function Canvas(props: Props) {
       if (Math.hypot(e.clientX - pm.cx, e.clientY - pm.cy) > 4) {
         if (rightLongPressTimer.current) { window.clearTimeout(rightLongPressTimer.current); rightLongPressTimer.current = null; }
         rightPanRef.current = true;
+        leftMarqueeRef.current = false;
         // capture shift at drag start
         (pendingMarqueeRef as any).shiftHeld = e.shiftKey;
         pendingMarqueeRef.current = null;
@@ -622,8 +646,9 @@ export default function Canvas(props: Props) {
       const ivy = ((e.clientY - d.lastY) / dt) * 16;
       const vx = d.vx * 0.35 + ivx * 0.65;
       const vy = d.vy * 0.35 + ivy * 0.65;
-      setView({ x: d.ox + (e.clientX - d.sx), y: d.oy + (e.clientY - d.sy), z: viewRef.current.z });
+      setViewThrottled({ x: d.ox + (e.clientX - d.sx), y: d.oy + (e.clientY - d.sy), z: viewRef.current.z });
       setDrag({ ...d, lastX: e.clientX, lastY: e.clientY, lastT: now, vx, vy });
+      setInteracting(true);
       // Any motion during a right-button pan should suppress the context menu on release
       if (e.buttons === 2 || e.button === 2) rightPanRef.current = true;
       else if (Math.hypot(e.clientX - d.sx, e.clientY - d.sy) > 3 && (d as any).sx !== undefined) {
@@ -710,22 +735,26 @@ export default function Canvas(props: Props) {
     if (rightLongPressTimer.current && e.button !== 2) { window.clearTimeout(rightLongPressTimer.current); rightLongPressTimer.current = null; }
     if (pendingMarqueeRef.current) pendingMarqueeRef.current = null;
     // Left pending click: if no pan started, treat as click on empty canvas -> clear selection
-    if ((beginPan as any)._longLeftTimer) { window.clearTimeout((beginPan as any)._longLeftTimer); (beginPan as any)._longLeftTimer = null; }
-    if ((beginPan as any)._pendingLeft) {
-      const pend = (beginPan as any)._pendingLeft as { x: number; y: number };
-      (beginPan as any)._pendingLeft = null;
-      // If not dragging and click was on empty canvas, clear selection
-      if (!dragRef.current && Math.hypot(e.clientX - pend.x, e.clientY - pend.y) < 4) {
+    if ((beginPan as any)._longLeftTimer) { try{ window.clearTimeout((beginPan as any)._longLeftTimer);}catch{} (beginPan as any)._longLeftTimer = null; }
+    if ((beginPan as any)._pendingLeftMarquee) {
+      const pend = (beginPan as any)._pendingLeftMarquee as { sx: number; sy: number; cx: number; cy: number };
+      (beginPan as any)._pendingLeftMarquee = null;
+      if (!dragRef.current && Math.hypot(e.clientX - pend.cx, e.clientY - pend.cy) < 4) {
         if (!e.shiftKey && !e.ctrlKey && !e.metaKey) {
-          // Only clear if not already handling menu/picker
           if (!pickerOpen && !menu) {
             ed.setSelection([]);
             ed.setSelectedWires([]);
+            // Left-click empty canvas also closes AI chat (like Esc)
+            try { (onCloseAI as any)?.(); } catch {}
           }
         }
       }
     }
+    // also clear any legacy _pendingLeft still hanging (cleanup)
+    if ((beginPan as any)._pendingLeft) (beginPan as any)._pendingLeft = null;
     const d = dragRef.current;
+    setInteracting(false);
+    if (rafView.current) { cancelAnimationFrame(rafView.current); rafView.current = 0; }
     if (d?.kind === "pan") {
       if (Math.hypot(d.vx, d.vy) > 1.2) startInertia(d.vx, d.vy);
       try { (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId); } catch {}
@@ -779,7 +808,12 @@ export default function Canvas(props: Props) {
           .map((n) => n.id);
         const newSel = e.shiftKey ? [...new Set([...selection, ...hit])] : hit;
         ed.setSelection(newSel);
-        // Auto-divide into functional blocks (regions) after long-press marquee
+        // Left-click selection is temporary only — do NOT create Region (right-drag does)
+        if (leftMarqueeRef.current) {
+          // left selection done, no region, reset flag
+          leftMarqueeRef.current = false;
+        } else {
+        // Auto-divide into functional blocks (regions) after right marquee
         if (hit.length >= 2) {
           // Divide by connectivity: each connected component becomes a region
           const comps: string[][] = [];
@@ -819,10 +853,13 @@ export default function Canvas(props: Props) {
             }
           }, 0);
         }
+        } // end left vs right
       } else if (e.detail === 2) {
         fit();
       }
       swipeRef.current = null;
+      // safety: if not reset earlier, clear left flag
+      leftMarqueeRef.current = false;
     }
     if (d?.kind === "wire") {
       let hp = hoverPort;
@@ -1565,7 +1602,7 @@ export default function Canvas(props: Props) {
             <stop offset="1" stopColor="#ffffff" stopOpacity="0" />
           </radialGradient>
         </defs>
-        <g transform={`translate(${view.x},${view.y}) scale(${view.z})`}>
+        <g transform={`translate(${view.x},${view.y}) scale(${view.z})`} style={{ willChange: isInteracting ? "transform" : undefined } as any}>
           {guides.v.map((x, i) => (
             <line key={"gv" + i} x1={x} y1={-9000} x2={x} y2={9000} stroke="var(--accent)" strokeWidth={1 / view.z} strokeDasharray="6 6" opacity={0.7} />
           ))}
@@ -1850,14 +1887,14 @@ export default function Canvas(props: Props) {
                 transition: "opacity 420ms ease",
               } as any}>
                 {/* layer backdrop tint — sufficiently blurred painting background, not attracting focus */}
-                {!flattenLayers && (
+                {!flattenLayers && !isInteracting && (
                   <rect x={-8000} y={-8000} width={16000} height={130} fill={layer.color} opacity={isActive ? 0 : 0.035 + Math.abs(m.dist)*0.008} style={{ pointerEvents: "none", filter: "blur(18px)" }} />
                 )}
                 {effectiveNodes.map((n:any) => {
                   const lcol = layer.color;
                   const dm = depthMetrics(layers, activeLayerId, (n as any).layerId, flattenLayers);
                   const isRevealed = !!activeNet && activeNet.nodes.has(n.id);
-                  let effBlur = isRevealed ? Math.max(0, dm.blur - 1.8) : dm.blur;
+                  let effBlur = isInteracting ? 0 : (isRevealed ? Math.max(0, dm.blur - 1.8) : dm.blur);
                   let effOp = isRevealed ? Math.min(1, dm.opacity + 0.45) : dm.opacity;
                   let dim = !!activeNet && !activeNet.nodes.has(n.id);
                   // Picker mode: blur other components, keep selected sharp
@@ -1924,7 +1961,7 @@ export default function Canvas(props: Props) {
       <Minimap doc={doc} defs={defs} view={view} setView={setView} host={ref} onExpand={()=> setMapExpanded(true)} />
       {/* Explicit cancel-selection control — always visible when selection exists */}
       {(selection.length > 0 || selectedWires.length > 0) && (
-        <div className="absolute left-1/2 top-3 z-20 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--panel)]/90 px-2 py-1 shadow-[var(--shadow)] backdrop-blur-xl" style={{ backdropFilter: "blur(14px)" } as any}>
+        <div className="absolute left-1/2 top-3 z-20 -translate-x-1/2 flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--panel)]/90 px-2 py-1 shadow-[var(--shadow)] backdrop-blur-xl" style={{ backdropFilter: isInteracting ? "blur(4px)" : "blur(14px)" } as any}>
           <span className="hidden sm:inline text-micro font-bold text-[var(--muted)]">{selection.length ? `${selection.length} selected` : "1 wire selected"} · </span>
           <button type="button" onClick={() => { ed.setSelection([]); ed.setSelectedWires([]); setMenu(null); }} className="inline-flex items-center gap-1 rounded-full bg-[var(--panel2)] px-2.5 py-1 text-micro font-bold text-[var(--xx)] hover:bg-[var(--xx)] hover:text-white transition">
             <XCircle className="size-3.5" /> Cancel selection <span className="hidden sm:inline">(Esc)</span>
@@ -1934,14 +1971,14 @@ export default function Canvas(props: Props) {
       )}
       {/* Layer rail — painterly depth, blurred background, continuity (always there, state changes) */}
       <div className="absolute right-3 top-3 z-10 flex flex-col gap-2">
-        <div className="flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--panel)]/85 px-2 py-1.5 shadow-[var(--shadow)] backdrop-blur-xl" style={{ backdropFilter: "blur(14px) saturate(1.2)" } as any}>
+        <div className="flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-[var(--panel)]/85 px-2 py-1.5 shadow-[var(--shadow)] backdrop-blur-xl" style={{ backdropFilter: isInteracting ? "blur(6px)" : "blur(14px) saturate(1.2)" } as any}>
           <span className="px-1 text-micro font-bold uppercase tracking-wider text-[var(--muted)]">Layers</span>
           <div className="mx-1 h-4 w-px bg-[var(--border)]" />
           {sortedLayers.map((ly:any)=>{
             const isActive = ly.id===activeLayerId;
             const m = !flattenLayers ? depthMetrics(layers, activeLayerId, ly.id, false) : { blur:0, opacity:1, scale:1 } as any;
             return (
-              <span key={ly.id} className="relative inline-flex items-center">
+              <span key={ly.id} className="relative inline-flex items-center gap-0.5">
                 <button
                   type="button"
                   onClick={()=> (ed as any).setActiveLayer?.(ly.id)}
@@ -1951,8 +1988,6 @@ export default function Canvas(props: Props) {
                     // Right-click layer → offer to move selected (1 or N) here
                     const ids = selection.length ? [...selection] : [];
                     const p = toWorld(e.clientX, e.clientY);
-                    // Build a tiny inline menu via global menu state: use a synthetic node menu that moves to this layer
-                    // Instead of custom menu, just directly move if selection exists, else show menu with option
                     if (ids.length) {
                       (ed as any).moveSelectionToLayer?.(ly.id, ids);
                       (ed as any).setActiveLayer?.(ly.id);
@@ -1962,28 +1997,28 @@ export default function Canvas(props: Props) {
                     }
                   }}
                   title={`${ly.name} — ${isActive?"active (clear)":"blurred " + Math.round(m.blur*10)/10+"px"} · right-click to move selected here`}
-                  className={`relative grid h-7 place-items-center rounded-full px-2.5 pr-1 text-micro font-bold transition-all duration-400 ${isActive ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow" : "bg-[var(--panel2)] text-[var(--muted)] hover:text-[var(--text)]"}`}
+                  className={`relative grid h-7 place-items-center rounded-full px-2.5 text-micro font-bold transition-all duration-400 ${isActive ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow" : "bg-[var(--panel2)] text-[var(--muted)] hover:text-[var(--text)]"}`}
                   style={{
                     filter: isActive ? undefined : `blur(${Math.min(1.0, m.blur*0.18)}px)`,
                     opacity: isActive ? 1 : 0.86,
                     transform: isActive ? "scale(1.04)" : "scale(0.98)",
+                    cursor: "pointer",
+                    pointerEvents: "auto",
                   } as any}
                 >
-                  <span className="flex items-center gap-1.5">
+                  <span className="flex items-center gap-1.5" style={{ pointerEvents: "none" }}>
                     <span className="h-2 w-2 rounded-full" style={{ background: ly.color, boxShadow: isActive ? `0 0 6px ${ly.color}` : undefined }} />
                     <span className="hidden sm:inline">{ly.name}</span>
-                    {sortedLayers.length>1 && (
-                      <span
-                        role="button"
-                        tabIndex={0}
-                        onClick={(e)=> { e.stopPropagation(); if (confirm(`Delete layer "${ly.name}"? Nodes move to neighbor.`)) (ed as any).removeLayer?.(ly.id); }}
-                        onKeyDown={(e)=> { if(e.key==="Enter"||e.key===" ") { e.stopPropagation(); (e as any).preventDefault(); (ed as any).removeLayer?.(ly.id);} }}
-                        className="ml-1 grid h-5 w-5 place-items-center rounded-full text-[11px] leading-none hover:bg-black/10 dark:hover:bg-white/10"
-                        title={`Delete ${ly.name}`}
-                      >×</span>
-                    )}
                   </span>
                 </button>
+                {sortedLayers.length>1 && (
+                  <button
+                    type="button"
+                    onClick={(e)=> { e.stopPropagation(); if (confirm(`Delete layer "${ly.name}"? Nodes move to neighbor.`)) (ed as any).removeLayer?.(ly.id); }}
+                    className="grid h-7 w-7 place-items-center rounded-full border border-[var(--border)] bg-[var(--panel2)] text-[11px] leading-none text-[var(--muted)] hover:bg-[var(--xx)] hover:text-white hover:border-[var(--xx)] transition"
+                    title={`Delete ${ly.name}`}
+                  >×</button>
+                )}
               </span>
             );
           })}
@@ -1998,9 +2033,7 @@ export default function Canvas(props: Props) {
           </button>
           <button type="button" onClick={()=> (ed as any).addLayer?.()} className="grid h-7 w-7 place-items-center rounded-full border border-[var(--border)] bg-[var(--panel2)] text-[var(--muted)] hover:text-[var(--text)]" title="Add layer">+</button>
         </div>
-        <div className="pointer-events-none rounded-full bg-[var(--panel)]/70 px-2.5 py-1 text-center text-micro leading-none text-[var(--muted)] backdrop-blur-md" style={{ backdropFilter:"blur(8px)" } as any}>
-          <span className="hidden sm:inline">Slide vertically on empty canvas to switch layers — </span>blurry→clear • far→near
-        </div>
+        {/* Layers hint removed per request — no Slide vertically… text */}
       </div>
 
       {debugWireExtra && (
