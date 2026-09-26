@@ -65,6 +65,7 @@ export function evalPrimitive(
 ): { outs: Val[]; seq?: SeqCell } {
   const hold = seq ?? { q: 0, prevClk: 0 as Val };
 
+  if (kind === "TEXT") return { outs: [] };
   if (kind === "SOURCE") return { outs: [opts.srcVal ?? 0] };
   if (kind === "VCC") return { outs: [opts.constVal ?? 1] };
   if (kind === "GND") return { outs: [0] };

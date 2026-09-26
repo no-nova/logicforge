@@ -15,8 +15,8 @@ import {
   specOf,
 } from "@/lib/sim/circuit";
 import { type EditorAPI } from "@/lib/sim/store";
-import { clockDomains, criticalPath, inspectCircuit } from "@/lib/sim/inspect";
-import { emitVerilog } from "@/lib/sim/hdl";
+import { clockDomains, criticalPath, inspectCircuit } from "@/lib/sim/circuitInspection";
+import { generateVerilog as emitVerilog } from "@/lib/sim/circuitHdlConverter";
 
 const chip = (v: Val) =>
   v === 1
@@ -162,13 +162,46 @@ export default function Inspector({ ed, sim }: { ed: EditorAPI; sim: SimResult }
                     <button type="button" onClick={ed.rotateSelected} className="ui-btn-ghost">Rotate 90°</button>
                   </div>
                 </Card>
-                <Card title="Delay">
-                  <NumField
-                    label="Propagation (ticks)"
-                    value={node.delay ?? (node.type === "CUSTOM" ? 0 : CATALOG[node.type as Exclude<CNode["type"], "CUSTOM">]?.defaultDelay ?? 0)}
-                    onChange={(v) => update({ delay: Math.max(0, v) })}
-                  />
-                </Card>
+                {node.type === "TEXT" && (
+                  <Card title="Text">
+                    <textarea
+                      value={node.text ?? ""}
+                      onChange={(e) => update({ text: e.target.value })}
+                      rows={4}
+                      placeholder="Editable text — double-click node to edit"
+                      className="ui-input mt-1 min-h-20 w-full resize-y font-mono text-xs"
+                    />
+                    <div className="mt-2 flex flex-wrap gap-2">
+                      <button type="button" className="ui-btn-ghost" onClick={() => ed.convertTextToComponent(node.id, "BUFFER")}>
+                        To Buffer
+                      </button>
+                      <button type="button" className="ui-btn-ghost" onClick={() => ed.convertTextToComponent(node.id, "AND")}>
+                        To AND
+                      </button>
+                      <button type="button" className="ui-btn-ghost" onClick={() => ed.convertTextToComponent(node.id, "OR")}>
+                        To OR
+                      </button>
+                    </div>
+                    <p className="mt-2 text-micro text-[var(--muted)]">Right-click a TEXT note → Convert to Component. Right-click any component → Convert to Text.</p>
+                  </Card>
+                )}
+                {node.type !== "TEXT" && (
+                  <Card title="Convert">
+                    <button type="button" className="ui-btn-ghost w-full" onClick={() => ed.convertToText([node.id])}>
+                      Convert to Text
+                    </button>
+                    <p className="mt-1 text-micro text-[var(--muted)]">Turn this component into an editable text note. For a network, select multiple or Trace full network then Convert.</p>
+                  </Card>
+                )}
+                {node.type !== "TEXT" && (
+                  <Card title="Delay">
+                    <NumField
+                      label="Propagation (ticks)"
+                      value={node.delay ?? (node.type === "CUSTOM" ? 0 : CATALOG[node.type as Exclude<CNode["type"], "CUSTOM">]?.defaultDelay ?? 0)}
+                      onChange={(v) => update({ delay: Math.max(0, v) })}
+                    />
+                  </Card>
+                )}
                 {isGate(node.type) && GATE_INFO[node.type].maxIn > 1 && (
                   <Card title="Fan-in"><Fanin node={node} update={update} /></Card>
                 )}
@@ -185,7 +218,7 @@ export default function Inspector({ ed, sim }: { ed: EditorAPI; sim: SimResult }
                     <NumField label="Bits" value={node.bits ?? 4} onChange={(v) => update({ bits: Math.min(8, Math.max(2, v)) })} />
                   </Card>
                 )}
-                <Card title="Ports"><PortStates node={node} ed={ed} sim={sim} /></Card>
+                {node.type !== "TEXT" && <Card title="Ports"><PortStates node={node} ed={ed} sim={sim} /></Card>}
                 {isGate(node.type) && (
                   <Card title="Boolean">
                     <p className="text-xs leading-relaxed text-[var(--muted)]">{GATE_INFO[node.type].desc}</p>

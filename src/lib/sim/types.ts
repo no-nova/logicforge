@@ -32,6 +32,7 @@ export type NodeKind =
   | "DEC2"
   | "ADDER"
   | "DELAY"
+  | "TEXT"
   | "CUSTOM";
 
 export type NodeType = NodeKind;
@@ -54,6 +55,10 @@ export interface CNode {
   locked?: boolean;
   /** Expected steady-state value for an OUTPUT/LED node, for quick pass/fail checking against the actual simulated value. */
   expected?: 0 | 1;
+  /** Editable text content for TEXT nodes (annotation / HDL snippet) */
+  text?: string;
+  /** Layer assignment for depth composition — painterly layers (far → near). */
+  layerId?: string;
 }
 
 export interface Wire {
@@ -77,9 +82,36 @@ export interface Circuit {
   wires: Wire[];
 }
 
+export interface Layer {
+  id: string;
+  name: string;
+  color: string;
+  /** Sort order low=far (background) high=near (foreground) */
+  order: number;
+}
+
+export interface Region {
+  id: string;
+  name: string;
+  color: string;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  nodeIds: string[];
+}
+
 export interface Doc extends Circuit {
   defs: CustomDef[];
   name?: string;
+  /** Painterly layers — if missing, migrated to default stack */
+  layers?: Layer[];
+  /** Active layer id for editing / focal plane */
+  activeLayerId?: string;
+  /** Whether layers are flattened onto a single plane */
+  flattenLayers?: boolean;
+  /** Spatial regions (functional blocks) grouping nodes for quick inter-block wiring */
+  regions?: Region[];
 }
 
 export type CompGroup = "gates" | "io" | "seq" | "combo" | "bus" | "timing";

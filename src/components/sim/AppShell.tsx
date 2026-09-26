@@ -6,7 +6,7 @@ import Inspector from "./Inspector";
 import Library from "./Library";
 import Toolbar from "./Toolbar";
 import Waveform, { type Probe } from "./Waveform";
-import { FileDialog, FileMenu, ShortcutsModal, importJsonFile } from "./Overlays";
+import { FileDialog, FileMenu, HdlDialog, ShortcutsModal, importAnyFile, importHdlFile, importJsonFile } from "./Overlays";
 import {
   type SimResult,
   type Val,
@@ -18,9 +18,20 @@ import {
   portCounts,
   topologyKey,
 } from "@/lib/sim/circuit";
+import AIChatWindow from "./AIChatWindow";
+import { installAIBridge } from "@/lib/sim/aiBridge";
+import { loadSessions } from "@/lib/ai/memory";
 import { loadPrefs, savePrefs, useEditor } from "@/lib/sim/store";
 import { THEMES, applyTheme } from "@/lib/sim/themes";
-import { createEngine, pokeNow, resetEngine, stepTime, type TimedEngine, type TimingMode, type WaveSample } from "@/lib/sim/timed";
+import {
+  createEngine,
+  pokeNow,
+  resetEngine,
+  stepTime,
+  type TimedEngine,
+  type TimingMode,
+  type WaveSample,
+} from "@/lib/sim/timedSimulationEngine";
 import { useViewport } from "@/lib/sim/viewport";
 
 export default function AppShell() {
@@ -42,11 +53,32 @@ export default function AppShell() {
   const [spacePan, setSpacePan] = useState(false);
   const [help, setHelp] = useState(false);
   const [filesOpen, setFilesOpen] = useState(false);
+  const [hdlOpen, setHdlOpen] = useState(false);
   const [narrow, setNarrow] = useState(false);
   const [cursor, setCursor] = useState<{ x: number; y: number } | null>(null);
+  const [showDepthHint, setShowDepthHint] = useState(() => {
+    try { return localStorage.getItem("logicforge.hideDepthHint") !== "1"; } catch { return true; }
+  });
   const centerRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const hdlFileRef = useRef<HTMLInputElement>(null);
   const engineRef = useRef<TimedEngine | null>(null);
+  // AI Chat windows — floating at top, multiple instances, memory persisted
+  const [aiWindows, setAiWindows] = useState<{ id: string; nodeId?: string }[]>(() => {
+    try {
+      const saved = loadSessions();
+      // start empty; sessions are loaded inside each window, but keep windows empty initially
+      return [];
+    } catch { return []; }
+  });
+  const openAIChat = useCallback((nodeId?: unknown) => {
+    const safe = typeof nodeId === "string" && nodeId.length < 80 ? nodeId : undefined;
+    const nid = `ai_${Date.now().toString(36)}${Math.random().toString(36).slice(2,5)}`;
+    setAiWindows((prev) => [...prev, { id: nid, nodeId: safe }]);
+  }, []);
+  const closeAIChat = useCallback((wid: string) => {
+    setAiWindows((prev) => prev.filter((w) => w.id !== wid));
+  }, []);
   const topoRef = useRef("");
   const [sim, setSim] = useState<SimResult | null>(null);
   const [wave, setWave] = useState<WaveSample[]>([]);
@@ -65,6 +97,13 @@ export default function AppShell() {
       themeId, wireStyle, snapOn, wheelZoom, waveformOpen: waveOpen, timingMode, leftOpen, rightOpen, reduceGlow, glossy,
     });
   }, [themeId, wireStyle, snapOn, wheelZoom, waveOpen, timingMode, leftOpen, rightOpen, reduceGlow, glossy]);
+
+  useEffect(() => {
+    if (showDepthHint) {
+      const tid = setTimeout(() => setShowDepthHint(false), 9000);
+      return () => clearTimeout(tid);
+    }
+  }, [showDepthHint]);
 
   useEffect(() => {
     const mq = window.matchMedia("(max-width: 720px)");
@@ -135,6 +174,12 @@ export default function AppShell() {
     setSim(eng.last);
     setWave([...eng.wave]);
   }, []);
+
+  // Install AI disclosure bridge (exposes /api/ai/snapshot, /api/ai/chat via window.fetch patch + window.logicforgeAI)
+  useEffect(() => {
+    if (!ed.ready) return;
+    try { installAIBridge(ed as any, () => engineRef.current?.last ?? null, () => view); } catch {}
+  }, [ed, ed.ready, view]);
 
   const ensureEngine = useCallback(() => {
     const d = edRef.current.doc;
@@ -249,6 +294,16 @@ export default function AppShell() {
       if (e.code === "Space") setSpacePan(false);
     };
     const onKey = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === "t" && !e.metaKey && !e.ctrlKey && !e.altKey) {
+        const tag = (e.target as HTMLElement | null)?.tagName;
+        const isFieldT = !!tag && (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (e.target as HTMLElement).isContentEditable);
+        if (!isFieldT) {
+          e.preventDefault();
+          // Open AI chat floating at top — T triggers a new window or ensures one is visible
+          setAiWindows((prev) => prev.length ? prev : [{ id: `ai_${Date.now().toString(36)}${Math.random().toString(36).slice(2,4)}`, nodeId: undefined }]);
+          return;
+        }
+      }
       if (isField(e.target)) return;
       const api = edRef.current;
       const mod = e.metaKey || e.ctrlKey;
@@ -278,7 +333,7 @@ export default function AppShell() {
         api.setSelection(api.doc.nodes.map((n) => n.id));
       } else if (mod && e.key.toLowerCase() === "s") {
         e.preventDefault();
-        import("@/lib/sim/hdl").then(({ downloadJson }) => {
+        import("@/lib/sim/circuitHdlConverter").then(({ downloadJsonFile: downloadJson }) => {
           downloadJson(`${(api.doc.name || "circuit").replace(/\s+/g, "-")}.logicforge.json`, api.doc);
           toast.success("Saved JSON");
         });
@@ -322,6 +377,7 @@ export default function AppShell() {
         api.setSelectedWires([]);
         setHelp(false);
         setFilesOpen(false);
+        if (aiWindows.length) setAiWindows([]);
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
         api.nudge(e.shiftKey ? -GRID * 5 : -GRID, 0);
@@ -334,6 +390,15 @@ export default function AppShell() {
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
         api.nudge(0, e.shiftKey ? GRID * 5 : GRID);
+      } else if (!mod && (e.key.toLowerCase() === "w" || e.key.toLowerCase() === "a" || e.key.toLowerCase() === "s" || e.key.toLowerCase() === "d")) {
+        e.preventDefault();
+        const k = e.key.toLowerCase();
+        const speed = e.shiftKey ? 9 : 5;
+        // Smooth WASD: apply impulse via inertia system so it eases, not jolts
+        const vx = k === "a" ? speed * 14 : k === "d" ? -speed * 14 : 0;
+        const vy = k === "w" ? speed * 14 : k === "s" ? -speed * 14 : 0;
+        setView((v) => ({ ...v, x: v.x + vx * 0.65, y: v.y + vy * 0.65 }));
+        startInertia(vx * 0.52, vy * 0.52);
       }
     };
     window.addEventListener("keydown", onDown);
@@ -344,7 +409,7 @@ export default function AppShell() {
       window.removeEventListener("keyup", onUp);
       window.removeEventListener("keydown", onKey);
     };
-  }, [fit, step, setView]);
+  }, [fit, step, setView, aiWindows, openAIChat]);
 
   const theme = THEMES.find((t) => t.id === themeId) ?? THEMES[0];
   const live = sim;
@@ -363,7 +428,7 @@ export default function AppShell() {
       style={{ background: "var(--bg)" }}
     >
       <Toaster theme={theme.dark ? "dark" : "light"} position="bottom-right" />
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-[var(--border)] bg-[var(--panel)] px-2 sm:px-3">
+      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-[var(--border)] bg-[var(--panel)]/85 px-2 sm:px-3 backdrop-blur-xl" style={{ backdropFilter: "blur(16px) saturate(1.15)", boxShadow: "0 4px 24px rgba(0,0,0,0.06)" } as any}>
         <div className="flex items-center gap-2">
           <div className="grid h-7 w-7 place-items-center rounded-md" style={{ background: "var(--accent)" }}>
             <svg viewBox="0 0 24 24" className="h-4 w-4" fill="none" stroke="var(--accent-fg)" strokeWidth={2.2} strokeLinecap="round">
@@ -380,16 +445,37 @@ export default function AppShell() {
         </div>
 
         <div className="mx-1 hidden h-6 w-px bg-[var(--border)] sm:block" />
-        <FileMenu ed={ed} onOpenFiles={() => setFilesOpen(true)} fileRef={fileRef} />
+        <FileMenu ed={ed} onOpenFiles={() => setFilesOpen(true)} fileRef={fileRef} hdlFileRef={hdlFileRef} onOpenHdl={() => setHdlOpen(true)} />
+        <button type="button" className="ui-btn-ghost hidden sm:inline-flex" onClick={() => setHdlOpen(true)} title="Circuit ↔ HDL">
+          HDL
+        </button>
         <button type="button" className="ui-btn-ghost" onClick={() => setHelp(true)}>
           Shortcuts
+        </button>
+        <button type="button" className="ui-btn-ghost hidden sm:inline-flex items-center gap-1" onClick={() => openAIChat()} title="AI Chat (T) — right-click component to ask about it">
+          <span>AI</span>
         </button>
         <input
           ref={fileRef}
           type="file"
-          accept="application/json"
+          accept="application/json,.json"
           className="hidden"
-          onChange={(e) => e.target.files?.[0] && importJsonFile(e.target.files[0], ed.load)}
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) importAnyFile(f, ed.load);
+            e.currentTarget.value = "";
+          }}
+        />
+        <input
+          ref={hdlFileRef}
+          type="file"
+          accept=".v,.vhd,.vhdl,.sv,.json"
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            if (f) importHdlFile(f, ed.load);
+            e.currentTarget.value = "";
+          }}
         />
 
         <div className="ml-auto flex items-center gap-1.5">
@@ -416,9 +502,10 @@ export default function AppShell() {
         </div>
       </header>
 
+      <style>{`@keyframes panelIn{0%{opacity:0;transform:translateX(-8px);filter:blur(8px)}100%{opacity:1;transform:translateX(0);filter:blur(0)}} @keyframes panelInR{0%{opacity:0;transform:translateX(8px);filter:blur(8px)}100%{opacity:1;transform:translateX(0);filter:blur(0)}}`}</style>
       <div className="flex min-h-0 flex-1">
         {leftOpen && (
-          <aside className={`${narrow ? "absolute inset-y-12 left-0 z-20 w-[min(18rem,90vw)] shadow-[var(--shadow)]" : "w-56"} shrink-0 border-r border-[var(--border)] bg-[var(--panel)]`}>
+          <aside className={`${narrow ? "absolute inset-y-12 left-0 z-30 w-[min(18rem,90vw)] shadow-[var(--shadow)]" : "w-56"} shrink-0 border-r border-[var(--border)] bg-[var(--panel)]/90 backdrop-blur-xl animate-[panelIn_280ms_cubic-bezier(.2,.8,.2,1)]`} style={{ backdropFilter: "blur(18px) saturate(1.15)" } as any}>
             <Library ed={ed} centerWorld={centerWorld} />
           </aside>
         )}
@@ -442,6 +529,8 @@ export default function AppShell() {
               onToggleSwitch={toggleSwitch}
               onCursor={setCursor}
               fit={fit}
+              onOpenAI={openAIChat}
+              onCloseAI={() => { /* left-click empty canvas closes AI like Esc */ if (aiWindows.length) setAiWindows([]); }}
             />
           )}
           <div className="pointer-events-none absolute left-3 top-3 flex flex-wrap gap-1.5 text-micro">
@@ -475,11 +564,23 @@ export default function AppShell() {
         </main>
 
         {rightOpen && (
-          <aside className={`${narrow ? "absolute inset-y-12 right-0 z-20 w-[min(20rem,92vw)] shadow-[var(--shadow)]" : "w-72"} shrink-0 border-l border-[var(--border)] bg-[var(--panel)]`}>
+          <aside className={`${narrow ? "absolute inset-y-12 right-0 z-30 w-[min(20rem,92vw)] shadow-[var(--shadow)]" : "w-72"} shrink-0 border-l border-[var(--border)] bg-[var(--panel)]/90 backdrop-blur-xl animate-[panelIn_280ms_cubic-bezier(.2,.8,.2,1)]`} style={{ backdropFilter: "blur(18px) saturate(1.15)" } as any}>
             {live && <Inspector ed={ed} sim={live} />}
           </aside>
         )}
       </div>
+
+      {/* Compact depth hint — dismissible, not obstructing canvas. Auto-hides after 9s. */}
+      {showDepthHint && (
+        <div className="pointer-events-auto fixed bottom-3 left-1/2 z-30 w-[min(560px,92vw)] -translate-x-1/2 rounded-full border border-[var(--border)] bg-[var(--panel)]/88 px-3 py-2 shadow-[var(--shadow)] backdrop-blur-xl animate-[hintIn_420ms_cubic-bezier(.2,.8,.2,1)]" style={{ backdropFilter: "blur(16px) saturate(1.15)" } as any}>
+          <div className="flex items-center gap-2.5 text-micro">
+            <span className="hidden h-6 w-6 place-items-center rounded-full bg-[var(--accent)]/15 text-[var(--accent)] sm:grid">◈</span>
+            <span className="flex-1 leading-none tracking-wide text-[var(--muted)]"><b className="text-[var(--text)]">Painterly depth</b> <span className="hidden sm:inline">— wheel scrolls page, slide vertically on canvas to travel layers (blurry→clear)</span><span className="sm:hidden">— slide on canvas to switch layers</span></span>
+            <button type="button" onClick={() => { setShowDepthHint(false); try{ localStorage.setItem("logicforge.hideDepthHint","1"); }catch{} }} className="grid h-7 w-7 place-items-center rounded-full bg-[var(--panel2)] text-[var(--muted)] hover:text-[var(--text)]">×</button>
+          </div>
+        </div>
+      )}
+      <style>{`@keyframes hintIn{0%{opacity:0;transform:translate(-50%,8px) scale(.98);filter:blur(8px)}100%{opacity:1;transform:translate(-50%,0) scale(1);filter:blur(0)}}`}</style>
 
       {waveOpen && live && (
         <div className="h-40 shrink-0 sm:h-44">
@@ -532,8 +633,34 @@ export default function AppShell() {
         />
       )}
 
+      {/* AI Chat windows — floating at top, multiple, memory, workflow, T to open, right-click component */}
+      {live && aiWindows.map((w) => (
+        <AIChatWindow
+          key={w.id}
+          id={w.id}
+          ed={ed}
+          sim={live}
+          view={view}
+          setView={setView}
+          initialNodeId={w.nodeId}
+          onClose={closeAIChat}
+          onNewChat={() => openAIChat()}
+        />
+      ))}
+      {/* Floating AI open button when no chat window — quick T hint */}
+      {live && aiWindows.length === 0 && (
+        <button
+          type="button"
+          onClick={() => openAIChat()}
+          className="fixed left-1/2 top-[68px] z-30 -translate-x-1/2 rounded-full border border-[var(--border)] bg-[var(--panel)]/90 px-3 py-1.5 text-micro font-bold shadow-[var(--shadow)] backdrop-blur-xl hover:bg-[var(--panel)]"
+          title="Open AI Chat (T)"
+        >
+          <span className="inline-flex items-center gap-1.5">🤖 AI Chat <span className="rounded bg-[var(--panel2)] px-1 py-0.5 text-[10px] leading-none">T</span></span>
+        </button>
+      )}
       <ShortcutsModal open={help} onClose={() => setHelp(false)} />
       <FileDialog open={filesOpen} ed={ed} onClose={() => setFilesOpen(false)} />
+      <HdlDialog open={hdlOpen} ed={ed} onClose={() => setHdlOpen(false)} />
     </div>
   );
 }

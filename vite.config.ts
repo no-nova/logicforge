@@ -1,4 +1,4 @@
-import { readdirSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Plugin } from "vite";
 import { defineConfig } from "vite";
@@ -7,10 +7,29 @@ import viteReact from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { nitro } from "nitro/vite";
 // @ts-expect-error JS plugin alongside the TS vite config
-import { grokPwaPlugin } from "./scripts/grok-pwa-plugin.mjs";
-// @ts-expect-error JS plugin alongside the TS vite config
 import { appEnvPlugin } from "./scripts/app-env-plugin.mjs";
 import { isMigrationFile } from "./scripts/migration-plan.mjs";
+
+/**
+ * Standard PWA plugin loader — canonical `pwa-plugin.mjs` with no legacy fallback.
+ * Returns null if the file is missing, so a fresh checkout without the optional
+ * branding files still starts `vite dev` cleanly (no UNRESOLVED_IMPORT).
+ */
+async function loadPwaPlugin(): Promise<Plugin | null> {
+  const specifier = "./scripts/pwa-plugin.mjs";
+  if (!existsSync(join(process.cwd(), specifier.slice(2)))) return null;
+  try {
+    const mod: any = await import(specifier);
+    const factory = mod.pwaPlugin ?? mod.default;
+    if (typeof factory === "function") {
+      const plugin = factory();
+      if (plugin) return plugin as Plugin;
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
 
 /** The files `src/lib/db.ts` globs — same directory, same non-recursive scope. */
 function hasGlobbedMigrations(root: string): boolean {
@@ -145,11 +164,17 @@ function authPopupPlugin(): Plugin {
 // `0.0.0.0:8080` is the live-preview contract — don't change host/port.
 // The dev server starts once `src/router.tsx` and `src/routes/` exist — see
 // AGENTS.md § "First scaffold".
-export default defineConfig(({ command, isPreview }) => ({
+export default defineConfig(async ({ command, isPreview }) => {
+  const pwaPluginInstance = await loadPwaPlugin();
+  return {
   server: {
     host: "0.0.0.0",
     port: 8080,
     strictPort: true,
+    // Allow the preview proxy host (e.g. 8080-*.e2b.app) — Vite 7+ blocks unknown Host headers by default.
+    // `true` allows any host; alternatively use [".e2b.app"].
+    allowedHosts: true as unknown as string[],
+    cors: true,
   },
   preview: {
     host: "127.0.0.1",
@@ -164,7 +189,8 @@ export default defineConfig(({ command, isPreview }) => ({
     // Dev-only /__app-env, read by scripts/check-auth-invariant.mjs.
     appEnvPlugin(),
     // PWA head + ?install=1 tutorial page; runs before Start/Nitro.
-    grokPwaPlugin(),
+    // Standard-named `pwaPlugin` with legacy fallback handled by `loadPwaPlugin`.
+    ...(pwaPluginInstance ? [pwaPluginInstance] : []),
     tailwindcss(),
     tanstackStart(),
     ...(command === "build" || isPreview
@@ -180,4 +206,5 @@ export default defineConfig(({ command, isPreview }) => ({
       : []),
     viteReact(),
   ],
-}));
+  };
+});

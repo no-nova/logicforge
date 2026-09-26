@@ -1,7 +1,15 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { type EditorAPI } from "@/lib/sim/store";
-import { SAMPLES } from "@/lib/sim/demos";
-import { downloadJson, downloadText, emitVerilog, emitVhdl } from "@/lib/sim/hdl";
+import { SAMPLES } from "@/lib/sim/demoCircuits";
+import {
+  downloadJsonFile as downloadJson,
+  downloadTextFile as downloadText,
+  generateVerilog as emitVerilog,
+  generateVhdl as emitVhdl,
+  parseHardwareDescriptionLanguage as parseHdl,
+  parseVerilogHdl as parseVerilog,
+  parseVhdlHdl as parseVhdl,
+} from "@/lib/sim/circuitHdlConverter";
 import { type Doc } from "@/lib/sim/circuit";
 import { toast } from "sonner";
 
@@ -143,10 +151,14 @@ export function FileMenu({
   ed,
   onOpenFiles,
   fileRef,
+  hdlFileRef,
+  onOpenHdl,
 }: {
   ed: EditorAPI;
   onOpenFiles: () => void;
   fileRef: React.RefObject<HTMLInputElement | null>;
+  hdlFileRef: React.RefObject<HTMLInputElement | null>;
+  onOpenHdl: () => void;
 }) {
   const [open, setOpen] = useState(false);
   const [samples, setSamples] = useState(false);
@@ -172,16 +184,19 @@ export function FileMenu({
       {open && (
         <>
           <button type="button" className="fixed inset-0 z-30 cursor-default" onClick={() => { setOpen(false); setSamples(false); }} aria-label="Close menu" />
-          <div className="absolute left-0 top-9 z-40 w-52 rounded-xl border border-[var(--border)] bg-[var(--panel)] p-1 shadow-[var(--shadow)]">
+          <div className="absolute left-0 top-9 z-40 w-60 rounded-xl border border-[var(--border)] bg-[var(--panel)] p-1 shadow-[var(--shadow)]">
             <MenuItem onClick={() => { ed.newFile(); setOpen(false); }}>New</MenuItem>
             <MenuItem onClick={() => { onOpenFiles(); setOpen(false); }}>Open…</MenuItem>
             <MenuItem onClick={() => { ed.renameFile(ed.fileName); toast.success("Saved"); setOpen(false); }}>Save</MenuItem>
             <MenuItem onClick={() => { onOpenFiles(); setOpen(false); }}>Save as…</MenuItem>
             <div className="my-1 h-px bg-[var(--border)]" />
             <MenuItem onClick={exportJson}>Export JSON</MenuItem>
-            <MenuItem onClick={exportV}>Export Verilog</MenuItem>
-            <MenuItem onClick={exportVhdl}>Export VHDL</MenuItem>
+            <MenuItem onClick={exportV}>Export Verilog (IR→HDL)</MenuItem>
+            <MenuItem onClick={exportVhdl}>Export VHDL (IR→HDL)</MenuItem>
+            <div className="my-1 h-px bg-[var(--border)]" />
             <MenuItem onClick={() => fileRef.current?.click()}>Import JSON</MenuItem>
+            <MenuItem onClick={() => hdlFileRef.current?.click()}>Import HDL (Verilog/VHDL → IR)</MenuItem>
+            <MenuItem onClick={() => { onOpenHdl(); setOpen(false); }}>HDL Editor (bidirectional)</MenuItem>
             <div className="my-1 h-px bg-[var(--border)]" />
             <div className="relative">
               <MenuItem onClick={() => setSamples((s) => !s)}>Samples</MenuItem>
@@ -213,12 +228,13 @@ export function FileMenu({
   );
 }
 
-function MenuItem({ children, onClick }: { children: React.ReactNode; onClick: () => void }) {
+function MenuItem({ children, onClick, disabled }: { children: React.ReactNode; onClick: () => void; disabled?: boolean }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className="flex w-full rounded-lg px-2.5 py-1.5 text-left text-xs text-[var(--text)] hover:bg-[var(--panel2)]"
+      disabled={disabled}
+      className={`flex w-full rounded-lg px-2.5 py-1.5 text-left text-xs ${disabled ? "opacity-40 cursor-not-allowed" : "text-[var(--text)] hover:bg-[var(--panel2)]"}`}
     >
       {children}
     </button>
@@ -239,4 +255,215 @@ export function importJsonFile(file: File, load: (d: Doc) => void) {
     }
   };
   r.readAsText(file);
+}
+
+export function importHdlFile(file: File, load: (d: Doc) => void) {
+  const r = new FileReader();
+  r.onload = () => {
+    try {
+      const text = String(r.result);
+      // Try to auto-detect via content and extension
+      const isVhdl = /\.vhd(l)?$/i.test(file.name) || /entity\s+\w+\s+is/i.test(text);
+      const isVerilog = /\.v$/i.test(file.name) || /module\s+\w+/i.test(text);
+      let res;
+      if (isVhdl && !isVerilog) res = parseVhdl(text);
+      else if (isVerilog && !isVhdl) res = parseVerilog(text);
+      else res = parseHdl(text);
+      if (res.doc.nodes.length === 0 && res.errors.length) {
+        toast.error(res.errors[0] || "Could not parse HDL");
+        return;
+      }
+      if (res.warnings.length) toast.message(res.warnings[0]);
+      load(res.doc);
+      // Set file name from HDL module/entity if available
+      toast.success(`Imported HDL: ${res.doc.nodes.length} nodes, ${res.doc.wires.length} wires`);
+    } catch (e) {
+      toast.error(`HDL import failed: ${String(e)}`);
+    }
+  };
+  r.readAsText(file);
+}
+
+export function importAnyFile(file: File, load: (d: Doc) => void) {
+  const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
+  if (ext === "json") return importJsonFile(file, load);
+  if (ext === "v" || ext === "vhd" || ext === "vhdl") return importHdlFile(file, load);
+  // Try JSON first, fallback to HDL
+  const r = new FileReader();
+  r.onload = () => {
+    const text = String(r.result);
+    try {
+      const d = JSON.parse(text) as Doc;
+      if (Array.isArray(d.nodes) && Array.isArray(d.wires)) {
+        load({ ...d, defs: d.defs ?? [] });
+        toast.success("Imported circuit");
+        return;
+      }
+    } catch { /* not json */ }
+    try {
+      const res = parseHdl(text);
+      if (res.doc.nodes.length) {
+        if (res.warnings.length) toast.message(res.warnings[0]);
+        load(res.doc);
+        toast.success(`Imported HDL: ${res.doc.nodes.length} nodes`);
+        return;
+      }
+    } catch { /* ignore */ }
+    toast.error("Unsupported file format");
+  };
+  r.readAsText(file);
+}
+
+// ---------------------------------------------------------------------------
+// HDL Dialog — bidirectional Circuit IR ↔ HDL editor
+// ---------------------------------------------------------------------------
+
+export function HdlDialog({
+  open,
+  onClose,
+  ed,
+}: {
+  open: boolean;
+  onClose: () => void;
+  ed: EditorAPI;
+}) {
+  const [lang, setLang] = useState<"verilog" | "vhdl">("verilog");
+  const initial = useMemo(() => {
+    if (!open) return "";
+    return lang === "verilog" ? emitVerilog(ed.doc) : emitVhdl(ed.doc);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, lang, ed.doc]);
+  const [text, setText] = useState(initial);
+  const [error, setError] = useState<string | null>(null);
+  const [info, setInfo] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setText(lang === "verilog" ? emitVerilog(ed.doc) : emitVhdl(ed.doc));
+      setError(null);
+      setInfo(null);
+    }
+  }, [open, lang, ed.doc]);
+
+  const counts = useMemo(() => {
+    try {
+      const res = lang === "verilog" ? parseVerilog(text) : parseVhdl(text);
+      if (!res.doc.nodes.length) return null;
+      return `${res.doc.nodes.length} nodes · ${res.doc.wires.length} wires`;
+    } catch {
+      return null;
+    }
+  }, [text, lang]);
+
+  if (!open) return null;
+
+  const onApply = () => {
+    try {
+      const res = lang === "verilog" ? parseVerilog(text) : parseVhdl(text);
+      // Also try generic if strict fails but still has nodes
+      const effective = res.doc.nodes.length ? res : parseHdl(text);
+      if (effective.errors.length && !effective.doc.nodes.length) {
+        setError(effective.errors.join("\n"));
+        return;
+      }
+      if (effective.warnings.length) setInfo(effective.warnings.join("\n"));
+      else setInfo(null);
+      if (!effective.doc.nodes.length) {
+        setError("No logic found in HDL");
+        return;
+      }
+      ed.load(effective.doc);
+      toast.success(`HDL → Circuit: ${effective.doc.nodes.length} nodes`);
+      onClose();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const onDownload = () => {
+    const ext = lang === "verilog" ? "v" : "vhd";
+    downloadText(`${(ed.doc.name || "circuit").replace(/\s+/g, "-")}.${ext}`, text);
+    toast.success(`Downloaded ${lang}`);
+  };
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast.success("Copied HDL to clipboard");
+    } catch {
+      toast.error("Copy failed");
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 grid place-items-center bg-black/50 p-4" onClick={onClose}>
+      <div
+        className="flex max-h-[86vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--panel)] shadow-[var(--shadow)]"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-3">
+          <div>
+            <h2 className="text-sm font-semibold text-[var(--text)]">Circuit ↔ HDL</h2>
+            <p className="text-micro text-[var(--muted)]">Bidirectional conversion. Edit HDL and apply to canvas, or update canvas and re-export.</p>
+          </div>
+          <button type="button" className="ui-btn-ghost" onClick={onClose}>
+            Close
+          </button>
+        </div>
+
+        <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-2">
+          <div className="flex rounded-lg border border-[var(--border)] p-0.5">
+            <button
+              type="button"
+              onClick={() => setLang("verilog")}
+              className={`rounded-md px-3 py-1 text-xs font-bold ${lang === "verilog" ? "bg-[var(--accent)] text-[var(--accent-fg)]" : "text-[var(--muted)]"}`}
+            >
+              Verilog
+            </button>
+            <button
+              type="button"
+              onClick={() => setLang("vhdl")}
+              className={`rounded-md px-3 py-1 text-xs font-bold ${lang === "vhdl" ? "bg-[var(--accent)] text-[var(--accent-fg)]" : "text-[var(--muted)]"}`}
+            >
+              VHDL
+            </button>
+          </div>
+          <span className="ml-auto text-micro text-[var(--muted)]">
+            {ed.doc.nodes.length} nodes → HDL · {counts ?? "—"}
+          </span>
+          <span className="hidden text-micro text-[var(--muted)] sm:block">IR ↔ {lang}</span>
+        </div>
+
+        <div className="min-h-0 flex-1 overflow-hidden p-3">
+          <textarea
+            value={text}
+            onChange={(e) => { setText(e.target.value); setError(null); }}
+            spellCheck={false}
+            className="h-full min-h-[320px] w-full resize-none rounded-xl border border-[var(--border)] bg-[var(--panel2)] p-3 font-mono text-xs leading-relaxed text-[var(--text)] outline-none focus:border-[var(--accent)]"
+            placeholder={lang === "verilog" ? "module ..." : "entity ..."}
+          />
+        </div>
+
+        {(error || info) && (
+          <div className="mx-3 mb-2 rounded-lg border px-3 py-2 text-xs leading-relaxed" style={{ borderColor: error ? "var(--xx)" : "var(--border)", background: error ? "color-mix(in srgb, var(--xx) 10%, transparent)" : "var(--panel2)", color: error ? "var(--xx)" : "var(--muted)" }}>
+            {error ? <pre className="whitespace-pre-wrap font-mono">{error}</pre> : <span>{info}</span>}
+          </div>
+        )}
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-[var(--border)] bg-[var(--panel)] px-4 py-3">
+          <button type="button" className="ui-btn-ghost" onClick={onCopy}>Copy</button>
+          <button type="button" className="ui-btn-ghost" onClick={onDownload}>Download .{lang === "verilog" ? "v" : "vhd"}</button>
+          <button type="button" className="ui-btn-ghost" onClick={() => setText(lang === "verilog" ? emitVerilog(ed.doc) : emitVhdl(ed.doc))}>Reset from canvas (IR→HDL)</button>
+          <div className="ml-auto flex items-center gap-2">
+            <button type="button" className="ui-btn-ghost" onClick={onClose}>Cancel</button>
+            <button type="button" className="ui-btn-primary" onClick={onApply}>Apply HDL → Circuit</button>
+          </div>
+        </div>
+
+        <div className="border-t border-[var(--border)] bg-[var(--panel2)] px-4 py-2 text-micro leading-relaxed text-[var(--muted)]">
+          <span className="font-bold text-[var(--text)]">How it works:</span> <span className="font-mono">Circuit IR</span> (nodes/wires on canvas) ↔ <span className="font-mono">HDL</span> (Verilog / VHDL text). Export embeds an IR comment for lossless round-trip; imported HDL without that comment is parsed structurally (gates, muxes, sequential).
+        </div>
+      </div>
+    </div>
+  );
 }

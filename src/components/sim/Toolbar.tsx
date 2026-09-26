@@ -1,7 +1,6 @@
 import {
-  AlignHorizontalSpaceAround,
-  AlignVerticalSpaceAround,
   Copy,
+  Layers,
   Magnet,
   Maximize2,
   Pause,
@@ -12,12 +11,13 @@ import {
   Spline,
   Trash2,
   Undo2,
+  Wand2,
   ZoomIn,
   ZoomOut,
 } from "lucide-react";
 import { type SimResult } from "@/lib/sim/circuit";
 import { type EditorAPI } from "@/lib/sim/store";
-import { type TimingMode } from "@/lib/sim/timed";
+import { type TimingMode } from "@/lib/sim/timedSimulationEngine";
 import { type View, clampZ } from "@/lib/sim/viewport";
 
 interface Props {
@@ -78,7 +78,7 @@ const Div = () => <div className="mx-1 hidden h-6 w-px bg-[var(--border)] sm:blo
 export default function Toolbar(p: Props) {
   const { ed, sim } = p;
   return (
-    <div className="flex flex-wrap items-center gap-1.5 border-t border-[var(--border)] bg-[var(--panel)] px-3 py-2">
+    <div className="flex flex-wrap items-center gap-1.5 border-t border-[var(--border)] bg-[var(--panel)]/88 px-3 py-2 backdrop-blur-xl" style={{ backdropFilter: "blur(16px) saturate(1.15)", boxShadow: "0 -8px 32px rgba(0,0,0,0.08)" } as any}>
       <B onClick={() => p.setRunning(!p.running)} active={p.running} title="Run / pause (P)">
         {p.running ? <Pause className="size-3.5" /> : <Play className="size-3.5" />}
         <span className="hidden sm:inline">{p.running ? "Pause" : "Run"}</span>
@@ -123,11 +123,13 @@ export default function Toolbar(p: Props) {
       </B>
 
       <Div />
-      <B onClick={() => ed.alignSelected("vspace")} disabled={ed.selection.length < 2} title="Distribute vertically">
-        <AlignVerticalSpaceAround className="size-3.5" />
-      </B>
-      <B onClick={() => ed.alignSelected("hspace")} disabled={ed.selection.length < 2} title="Distribute horizontally">
-        <AlignHorizontalSpaceAround className="size-3.5" />
+      <B
+        onClick={() => ed.autoLayout()}
+        disabled={!ed.doc.nodes.length}
+        title="Auto layout (Signal flow) — Logic layer distribution, minimize wire crossing"
+      >
+        <Wand2 className="size-3.5" />
+        <span className="hidden sm:inline">Auto layout</span>
       </B>
       <B onClick={() => p.setSnapOn(!p.snapOn)} active={p.snapOn} title="Snap to grid">
         <Magnet className="size-3.5" />
@@ -157,19 +159,48 @@ export default function Toolbar(p: Props) {
       </B>
 
       <Div />
-      <B onClick={() => p.setView((v) => ({ ...v, z: clampZ(v.z / 1.2) }))} title="Zoom out">
-        <ZoomOut className="size-3.5" />
-      </B>
-      <span className="w-12 text-center text-xs font-semibold tabular-nums text-[var(--muted)]">
-        {Math.round(p.view.z * 100)}%
-      </span>
-      <B onClick={() => p.setView((v) => ({ ...v, z: clampZ(v.z * 1.2) }))} title="Zoom in">
-        <ZoomIn className="size-3.5" />
-      </B>
-      <B onClick={p.fit} title="Fit (0 / F / double-click)">
-        <Maximize2 className="size-3.5" />
-        <span className="hidden sm:inline">Fit</span>
-      </B>
+      {/* Second/third-level View menu — layered with backdrop-blur (Apple continuity) */}
+      <div className="hidden sm:flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--panel2)]/70 px-1 py-1 backdrop-blur-xl" style={{ backdropFilter: "blur(10px)" } as any}>
+        <B onClick={() => p.setView((v) => ({ ...v, z: clampZ(v.z / 1.2) }))} title="Zoom out">
+          <ZoomOut className="size-3.5" />
+        </B>
+        <span className="w-10 text-center text-micro font-semibold tabular-nums text-[var(--muted)]">
+          {Math.round(p.view.z * 100)}%
+        </span>
+        <B onClick={() => p.setView((v) => ({ ...v, z: clampZ(v.z * 1.2) }))} title="Zoom in">
+          <ZoomIn className="size-3.5" />
+        </B>
+        <B onClick={p.fit} title="Fit (0 / F / double-click)">
+          <Maximize2 className="size-3.5" />
+        </B>
+      </div>
+      {/* Layer continuity controls — blurred → clear, 3D connectivity */}
+      <div className="flex items-center gap-1 rounded-full border border-[var(--border)] bg-[var(--panel)]/85 px-1.5 py-1 shadow-sm backdrop-blur-xl" style={{ backdropFilter: "blur(12px)" } as any}>
+        <Layers className="ml-1 size-3.5 text-[var(--muted)]" />
+        <span className="hidden px-1 text-micro font-bold uppercase tracking-wider text-[var(--muted)] lg:inline">Depth</span>
+        <button
+          type="button"
+          onClick={() => (p.ed as any).toggleFlattenLayers?.()}
+          className={`rounded-full px-2.5 py-1 text-micro font-bold transition-all ${ (p.ed as any).flattenLayers ? "bg-[var(--accent)] text-[var(--accent-fg)]" : "bg-[var(--panel2)] text-[var(--muted)] hover:text-[var(--text)]"}`}
+          title={(p.ed as any).flattenLayers ? "Flattened — single plane (click for 3D)" : "3D layers — click to flatten"}
+        >
+          {(p.ed as any).flattenLayers ? "Flat" : "3D"}
+        </button>
+        <div className="hidden items-center gap-1 lg:flex">
+          {((p.ed as any).layers ?? []).map((ly:any)=> (
+            <button
+              key={ly.id}
+              type="button"
+              onClick={()=> (p.ed as any).setActiveLayer?.(ly.id)}
+              className={`h-6 rounded-full px-2 text-micro font-semibold transition-all duration-700 ${ (p.ed as any).activeLayerId===ly.id ? "bg-[var(--accent)] text-[var(--accent-fg)] shadow" : "bg-[var(--panel2)] text-[var(--muted)] hover:bg-[var(--panel)]"}`}
+              style={{ borderLeft: `3px solid ${ly.color}` }}
+            >
+              {ly.name}
+            </button>
+          ))}
+          <button type="button" onClick={()=> (p.ed as any).addLayer?.()} className="grid h-6 w-6 place-items-center rounded-full border border-dashed border-[var(--border)] text-[var(--muted)] hover:text-[var(--text)]" title="Add layer">+</button>
+        </div>
+      </div>
 
       <div className="ml-auto flex items-center gap-3 pr-1 text-micro uppercase tracking-wider text-[var(--muted)]">
         <span className="hidden sm:inline">
