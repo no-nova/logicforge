@@ -452,8 +452,9 @@ export default function Canvas(props: Props) {
         return;
       }
       infoBlockUntil.current = Date.now() + 10000;
-      // Store pending pan to distinguish click vs drag
+      // Store pending pan to distinguish click vs drag — capture immediately so moves outside still track
       (beginPan as any)._pendingLeft = { x: e.clientX, y: e.clientY, ox: view.x, oy: view.y };
+      try { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId); } catch {}
       // Long-press fallback: if held without movement, still allow tiny nudge to start pan (helps touchpads)
       if ((beginPan as any)._longLeftTimer) window.clearTimeout((beginPan as any)._longLeftTimer);
       (beginPan as any)._longLeftTimer = window.setTimeout(() => {
@@ -529,18 +530,20 @@ export default function Canvas(props: Props) {
         }
       }
     }
-    // Pending left pan: start on movement >3px — no e.buttons gate (long-press left sometimes reported buttons=0 after preventDefault)
+    // Pending left pan: start on movement >2px — capture already at down, use origin for smooth delta
     if ((beginPan as any)._pendingLeft) {
       const pend = (beginPan as any)._pendingLeft as { x: number; y: number; ox: number; oy: number };
-      if (Math.hypot(e.clientX - pend.x, e.clientY - pend.y) > 3) {
+      const dist = Math.hypot(e.clientX - pend.x, e.clientY - pend.y);
+      if (dist > 2) {
         (beginPan as any)._pendingLeft = null;
-        // Start pan now
+        if ((beginPan as any)._longLeftTimer) { window.clearTimeout((beginPan as any)._longLeftTimer); (beginPan as any)._longLeftTimer = null; }
+        // Start pan now — sx/sy is origin so delta = current - origin, immediate visual feedback
         stopInertia();
         try { (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId); } catch {}
         const pdrag = {
           kind: "pan",
-          sx: e.clientX,
-          sy: e.clientY,
+          sx: pend.x,
+          sy: pend.y,
           ox: pend.ox,
           oy: pend.oy,
           lastX: e.clientX,
@@ -551,6 +554,8 @@ export default function Canvas(props: Props) {
         } as Drag;
         dragRef.current = pdrag;
         setDrag(pdrag);
+        // Apply pan immediately for this move (otherwise needs 2 moves to see displacement)
+        setView({ x: pend.ox + (e.clientX - pend.x), y: pend.oy + (e.clientY - pend.y), z: viewRef.current.z });
         return;
       }
     }

@@ -197,13 +197,15 @@ export default function AIChatWindow({ id, ed, sim, view, setView, initialNodeId
           workflow: [...local.workflow, { label: `Real API: ${aiConfig.provider}/${aiConfig.model}`, detail: `ok ${resp.status}` }],
         };
       } catch (e:any) {
-        // Fallback to mock on failure, but surface error
+        // Fallback to local mock on real API failure — don't scare user with raw fetch error
         const local = executeAICommand(prompt, ed, snapshot);
+        const hint = String(e?.message ?? e).slice(0, 120);
+        const isNetwork = /network|fetch|failed to fetch|load failed/i.test(hint);
         result = {
           success: local.success,
-          message: `(Real API failed: ${e?.message ?? String(e)})\n\n${local.message}`,
+          message: local.message + (isNetwork ? "\n\n[Note: Real API unreachable (\"" + hint.slice(0,60) + "\"), used local AI instead — set Mock provider or configure endpoint/key above.]" : "\n\n[Real API error: " + hint + " — used local AI.]"),
           actions: local.actions,
-          workflow: [...local.workflow, { label: "API error → fallback mock", detail: String(e?.message ?? e).slice(0,80) }],
+          workflow: [...local.workflow, { label: "API unreachable → used local mock", detail: hint.slice(0,80) }],
         };
       }
     } else {

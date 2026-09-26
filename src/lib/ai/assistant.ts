@@ -6,6 +6,7 @@
 import type { EditorAPI } from "@/lib/sim/store";
 import type { AISnapshot } from "@/lib/sim/aiSnapshot";
 import { CATALOG } from "@/lib/sim/catalog";
+import { uid, snap } from "@/lib/sim/circuit";
 
 export interface AICommandResult {
   success: boolean;
@@ -31,6 +32,150 @@ export function executeAICommand(
     const hit = layers.find((l: any) => l.name.toLowerCase().includes(name.toLowerCase()) || l.id.toLowerCase() === name.toLowerCase());
     return hit;
   };
+
+  // === Full adder intent (handles "make/build/create/generate full adder in midground") ===
+  if (lower.includes("full adder") || (lower.includes("full-adder")) || (lower.includes("adder") && (lower.includes("make") || lower.includes("build") || lower.includes("create") || lower.includes("generate") || lower.includes("full")))) {
+    workflow.push({ label: "Detected full adder request", detail: prompt.slice(0, 80) });
+    // Resolve target layer — explicit mention wins, otherwise active
+    let targetLayer: any = null;
+    if (lower.includes("background")) targetLayer = findLayer("background");
+    else if (lower.includes("foreground") || lower.includes("fore")) targetLayer = findLayer("fore");
+    else if (lower.includes("midground") || lower.includes("mid")) targetLayer = findLayer("mid") ?? findLayer("midground");
+    // If prompt says "in midground" explicitly, force midground
+    if (/in\s+mid/.test(lower) || /to\s+mid/.test(lower) || lower.includes("midground")) {
+      targetLayer = findLayer("mid") ?? findLayer("midground") ?? targetLayer;
+    }
+    const layerId: string | undefined = targetLayer?.id ?? (snapshot.view as any).activeLayerId ?? snapshot.layers[0]?.id;
+    const layerName = targetLayer?.name ?? snapshot.view.activeLayerName ?? "active";
+    workflow.push({ label: `Target layer: ${layerName}`, detail: layerId ?? "default" });
+
+    // Decide construction mode: if user says "from gates" or wants explicit gates, build gate-level; otherwise use ADDER primitive + IO
+    const wantsGates = lower.includes("gate") || lower.includes("xor") || lower.includes("from scratch");
+    // Activate target layer first (so UI reflects)
+    if (targetLayer) {
+      try { (ed as any).setActiveLayer?.(targetLayer.id); } catch {}
+    }
+    // Compute base position at view center
+    const view = snapshot.view as any;
+    const baseX = (400 - (view.x ?? 0)) / (view.z ?? 1);
+    const baseY = (300 - (view.y ?? 0)) / (view.z ?? 1);
+    // Avoid overlapping existing nodes: offset by existing bounds
+    let offsetX = 0;
+    let offsetY = 0;
+    if (snapshot.nodes.length) {
+      const xs = snapshot.nodes.map((n:any)=> n.x);
+      const ys = snapshot.nodes.map((n:any)=> n.y);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const avgY = ys.reduce((a:number,b:number)=>a+b,0)/ys.length;
+      // Place adder to the right of existing circuit if possible
+      if (maxX - minX > 200) {
+        offsetX = maxX + 120 - baseX;
+        offsetY = avgY - baseY;
+      }
+    }
+    const bx = snap(baseX + offsetX);
+    const by = snap(baseY + offsetY);
+
+    try {
+      if (wantsGates) {
+        // Gate-level full adder: 3 INPUT + 2 XOR + 2 AND + 1 OR + 2 OUTPUT = 10 nodes, 12 wires
+        workflow.push({ label: "Building gate-level full adder", detail: "2×XOR + 2×AND + 1×OR + 3 IN + 2 OUT" });
+        const lid = layerId;
+        // helper to make node
+        const mk = (type: string, x:number, y:number, extra:any={}): any => ({
+          id: uid((type.toLowerCase().slice(0,3)+"_")),
+          type: type as any,
+          x: snap(x),
+          y: snap(y),
+          rot: 0 as const,
+          inputs: ((): number => {
+            const spec = (CATALOG as any)[type];
+            return spec ? spec.defaultInputs : (type==="INPUT"?0:type==="OUTPUT"||type==="LED"?1:2);
+          })(),
+          label: extra.label,
+          layerId: lid,
+          ...(type==="INPUT" ? { value: 0 } : {}),
+          ...(type==="OUTPUT" ? {} : {}),
+          delay: (CATALOG as any)[type]?.defaultDelay ?? 1,
+        });
+        const nA = mk("INPUT", bx - 220, by - 60, { label: "A" });
+        const nB = mk("INPUT", bx - 220, by + 20, { label: "B" });
+        const nCin = mk("INPUT", bx - 220, by + 100, { label: "Cin" });
+        const xor1 = mk("XOR", bx - 40, by - 20);
+        const and1 = mk("AND", bx - 40, by + 80);
+        const xor2 = mk("XOR", bx + 120, by - 0);
+        const and2 = mk("AND", bx + 120, by + 100);
+        const or1 = mk("OR", bx + 260, by + 60);
+        const outS = mk("OUTPUT", bx + 400, by + 0, { label: "Sum" });
+        const outCout = mk("OUTPUT", bx + 400, by + 100, { label: "Cout" });
+        // set explicit labels for clarity
+        nA.label = "A"; nB.label = "B"; nCin.label = "Cin"; outS.label = "Sum"; outCout.label = "Cout";
+        const newNodes = [nA,nB,nCin,xor1,and1,xor2,and2,or1,outS,outCout];
+        const w = (from:string, fp:number, to:string, tp:number) => ({ id: uid("w"), from: { node: from, port: fp }, to: { node: to, port: tp } });
+        const newWires = [
+          w(nA.id,0,xor1.id,0),
+          w(nA.id,0,and1.id,0),
+          w(nB.id,0,xor1.id,1),
+          w(nB.id,0,and1.id,1),
+          w(xor1.id,0,xor2.id,0),
+          w(xor1.id,0,and2.id,0),
+          w(nCin.id,0,xor2.id,1),
+          w(nCin.id,0,and2.id,1),
+          w(and1.id,0,or1.id,0),
+          w(and2.id,0,or1.id,1),
+          w(xor2.id,0,outS.id,0),
+          w(or1.id,0,outCout.id,0),
+        ];
+        ed.commit((d:any)=> {
+          const ens = d.layers ? d : { ...d, layers: snapshot.layers as any, activeLayerId: layerId };
+          return { ...ens, nodes: [...ens.nodes, ...newNodes], wires: [...ens.wires, ...newWires] };
+        }, "AI: create full adder (gates) in "+layerName);
+        // select new nodes
+        setTimeout(()=> { try { ed.setSelection(newNodes.map(n=>n.id)); (ed as any).setActiveLayer?.(layerId); } catch {} }, 20);
+        actions.push(`create full adder (10 comps) in ${layerName} at (${bx},${by})`);
+        workflow.push({ label: "Placed 10 components", detail: newNodes.map(n=>n.type).join(", ") });
+        workflow.push({ label: "Wired 12 connections", detail: "Sum = A xor B xor Cin, Cout = (A&B)|(Cin&(A xor B))" });
+        return say(`✅ Created **full adder** in **${layerName}** at (${bx}, ${by}) — gate-level (2×XOR, 2×AND, 1×OR) with 3 inputs (A, B, Cin) and 2 outputs (Sum, Cout), fully wired (12 wires). Active layer set to ${layerName}. Select it to simulate — try toggling A/B/Cin!`);
+      } else {
+        // Using ADDER primitive (simpler, compact)
+        workflow.push({ label: "Building full adder with ADDER primitive", detail: "1×ADDER + 3 IN + 2 OUT" });
+        const lid = layerId;
+        const mk = (type: string, x:number, y:number, label?:string): any => ({
+          id: uid((type.toLowerCase().slice(0,3)+"_")),
+          type: type as any,
+          x: snap(x), y: snap(y), rot: 0 as const,
+          inputs: ((): number => { const s=(CATALOG as any)[type]; return s? s.defaultInputs : (type==="INPUT"?0:1); })(),
+          label, layerId: lid,
+          ...(type==="INPUT"?{value:0}:{}),
+          delay: (CATALOG as any)[type]?.defaultDelay ?? 1,
+        });
+        const nA = mk("INPUT", bx - 140, by - 40, "A");
+        const nB = mk("INPUT", bx - 140, by + 20, "B");
+        const nCin = mk("INPUT", bx - 140, by + 80, "Cin");
+        const adder = mk("ADDER", bx + 60, by + 20, "FULL ADDER");
+        const outS = mk("OUTPUT", bx + 220, by + 0, "Sum");
+        const outCout = mk("OUTPUT", bx + 220, by + 60, "Cout");
+        const newNodes = [nA,nB,nCin,adder,outS,outCout];
+        const w = (from:string, fp:number, to:string, tp:number) => ({ id: uid("w"), from:{node:from,port:fp}, to:{node:to,port:tp} });
+        const newWires = [
+          w(nA.id,0,adder.id,0),
+          w(nB.id,0,adder.id,1),
+          w(nCin.id,0,adder.id,2),
+          w(adder.id,0,outS.id,0),
+          w(adder.id,1,outCout.id,0),
+        ];
+        ed.commit((d:any)=> ({ ...d, nodes: [...d.nodes, ...newNodes], wires: [...d.wires, ...newWires] }), "AI: create full adder in "+layerName);
+        setTimeout(()=> { try { ed.setSelection(newNodes.map((n:any)=>n.id)); (ed as any).setActiveLayer?.(layerId); } catch {} }, 20);
+        actions.push(`create ADDER full adder in ${layerName} at (${bx},${by})`);
+        workflow.push({ label: "Placed 6 components", detail: "A,B,Cin → ADDER → Sum,Cout" });
+        workflow.push({ label: "Wired 5 connections", detail: "S=A xor B xor Cin, Cout=majority" });
+        return say(`✅ Created **full adder** in **${layerName}** at (${bx}, ${by}) — 1×ADDER block with 3 inputs (A, B, Cin) → Sum, Cout (5 wires). Active layer set to ${layerName}. Toggle the inputs to test — Sum = A⊕B⊕Cin, Cout = AB ∨ Cin(A⊕B). Ask "make gate-level full adder" for the XOR/AND/OR version!`);
+      }
+    } catch (e:any) {
+      return { success:false, message: `Failed to create full adder: ${e?.message ?? String(e)}`, actions, workflow };
+    }
+  }
 
   // Detect move to layer intents
   if (/(move|send|put).*layer/.test(lower)) {
@@ -84,7 +229,7 @@ export function executeAICommand(
     }
   }
 
-  if (/(create|add|place|insert).*?(and|or|not|nand|nor|xor|xnor|input|output|led|switch|clock|dff|mux|adder|counter)/.test(lower)) {
+  if (/(create|add|place|insert|make|build|generate|put).*?(and|or|not|nand|nor|xor|xnor|input|output|led|switch|clock|dff|mux|adder|counter)/.test(lower)) {
     workflow.push({ label: "Parsing component type from prompt" });
     const types = Object.keys(CATALOG).map((k) => k.toLowerCase());
     let found: string | null = null;
@@ -162,6 +307,19 @@ export function executeAICommand(
       }
     }
     return say(lines.join("\n"));
+  }
+
+  if (/(are you sure|can you (create|make|manipulate|add|build)|do you really)/.test(lower) && /(create|make|manipulate|add|build|control)/.test(lower)) {
+    workflow.push({ label: "Confirming AI capabilities", detail: "verified manipulation" });
+    return say(
+      `Yes — I can directly manipulate the circuit. Proven actions (try them):\n` +
+        `• **Create**: "make a full adder in midground" (just did? check canvas) — builds 6-10 components + wires in the requested layer.\n` +
+        `• **Add**: "add AND gate", "add INPUT", "make gate-level full adder"\n` +
+        `• **Move**: "move selected to Midground" / "move to Background" (1 or N selected, right-click → Move to layer also works)\n` +
+        `• **Connect / Duplicate / Delete / Rotate**: "connect selected", "duplicate selected", "delete selected"\n` +
+        `• **Explain**: "explain circuit" (I see coordinates, type, connections, on/off, layer, regions)\n` +
+        `Canvas is live — check Midground layer after "make a full adder". If nothing appeared, tell me the exact prompt and I'll retry with gate-level wiring.`
+    );
   }
 
   if (/(help|what can you do|commands)/.test(lower)) {
