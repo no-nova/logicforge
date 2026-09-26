@@ -673,146 +673,431 @@ export function useEditor(): EditorAPI {
   const autoLayout = useCallback(() => {
     const current = docRef.current;
     if (!current.nodes.length) return;
-    // Only layout selected components, centered around their relative network.
-    // If fewer than 2 selected, layout the whole circuit (fallback to global).
-    // This keeps auto-layout compatible with both ortho and curve routing:
-    // layers are left→right signal-flow, so beziers and ortho elbows both flow forward,
-    // and the group stays where the user was working instead of jumping to (80,300).
     const useSelection = selection.length >= 2;
     const targetIds = useSelection ? selection : current.nodes.map((n) => n.id);
     const targetSet = new Set(targetIds);
     const targetNodes = current.nodes.filter((n) => targetSet.has(n.id));
     if (!targetNodes.length) return;
-    // Compute centroid of the target group so we can re-center around it
     const centroidX = targetNodes.reduce((s, n) => s + n.x, 0) / targetNodes.length;
     const centroidY = targetNodes.reduce((s, n) => s + n.y, 0) / targetNodes.length;
 
     commit((d) => {
-      // Work on a copy of all nodes, but only reposition the target set
-      const allNodes = d.nodes;
+      const allNodes = d.nodes as CNode[];
       const allWires = d.wires;
-      // Build adjacency for the target subgraph (only wires where both ends are in targetSet
-      // are used for layering; external wires are ignored for level but kept for crossing calc if they connect inside)
-      const inMap = new Map<string, string[]>();
-      const outMap = new Map<string, string[]>();
-      for (const id of targetIds) {
-        inMap.set(id, []);
-        outMap.set(id, []);
+      const defs = (d as any).defs ?? current.defs ?? [];
+
+      // 1) Subgraph Phase: distinguish layout nodes vs constraint nodes (external neighbors)
+      // layoutNodes = targetSet (to be moved), external = adjacent but immovable, provides directional constraints
+      // e.g. INPUT -> A -> B, only A selected => external INPUT(left), B(right) => A placed in middle
+      const externalIds = new Set<string>();
+      const inExternal = new Map<string, string[]>(); // layoutId -> external preds
+      const outExternal = new Map<string, string[]>(); // layoutId -> external succs
+      for (const id of targetIds) { inExternal.set(id, []); outExternal.set(id, []); }
+      for (const w of allWires) {
+        const fromIn = targetSet.has(w.from.node);
+        const toIn = targetSet.has(w.to.node);
+        if (fromIn && !toIn) { externalIds.add(w.to.node); outExternal.get(w.from.node)!.push(w.to.node); }
+        else if (!fromIn && toIn) { externalIds.add(w.from.node); inExternal.get(w.to.node)!.push(w.from.node); }
       }
+      // Build internal adjacency only for layout nodes
+      const inMap = new Map<string, string[]>(); // internal preds
+      const outMap = new Map<string, string[]>();
+      const adj = new Map<string, string[]>(); // for SCC
+      const radj = new Map<string, string[]>();
+      for (const id of targetIds) { inMap.set(id, []); outMap.set(id, []); adj.set(id, []); radj.set(id, []); }
+      // also map wire port info for port-aware barycenter
+      const inPorts = new Map<string, { pred:string; predPort:number; myPort:number }[]>();
+      const outPorts = new Map<string, { succ:string; myPort:number; succPort:number }[]>();
+      for (const id of targetIds) { inPorts.set(id, []); outPorts.set(id, []); }
       for (const w of allWires) {
         if (targetSet.has(w.from.node) && targetSet.has(w.to.node)) {
           inMap.get(w.to.node)!.push(w.from.node);
           outMap.get(w.from.node)!.push(w.to.node);
+          adj.get(w.from.node)!.push(w.to.node);
+          radj.get(w.to.node)!.push(w.from.node);
+          inPorts.get(w.to.node)!.push({ pred: w.from.node, predPort: w.from.port, myPort: w.to.port });
+          outPorts.get(w.from.node)!.push({ succ: w.to.node, myPort: w.from.port, succPort: w.to.port });
         }
       }
-      const isSource = (n: CNode) =>
-        n.type === "INPUT" ||
-        n.type === "CLOCK" ||
-        n.type === "VCC" ||
-        n.type === "GND" ||
-        n.type === "TEXT" ||
-        (inMap.get(n.id)?.length ?? 0) === 0;
-      const isSink = (n: CNode) => n.type === "OUTPUT" || n.type === "LED";
+      const isSourceType = (n: CNode) => n.type === "INPUT" || n.type === "CLOCK" || n.type === "VCC" || n.type === "GND" || n.type === "TEXT";
+      const isSinkType = (n: CNode) => n.type === "OUTPUT" || n.type === "LED";
+      // For layout nodes, source if no internal + no external preds and isSourceType, else consider external
+      const isSource = (n: CNode) => {
+        if (isSourceType(n)) return true;
+        const internal = inMap.get(n.id)?.length ?? 0;
+        const external = inExternal.get(n.id)?.length ?? 0;
+        return internal===0 && external===0;
+      };
+      const isSink = (n: CNode) => isSinkType(n);
 
-      // Longest-path layering within the target subgraph
+      // 2) SCC → DAG: compress feedback loops (latch/flip-flop/oscillator/counter)
+      // A->B->C->A becomes [SCC] so DAG is acyclic; feedback wire kept short inside SCC
+      const visited = new Set<string>();
+      const order: string[] = [];
+      const dfs1 = (v:string) => {
+        visited.add(v);
+        for (const nb of adj.get(v) ?? []) if (!visited.has(nb)) dfs1(nb);
+        order.push(v);
+      };
+      for (const id of targetIds) if (!visited.has(id)) dfs1(id);
+      const comp = new Map<string, number>();
+      let compCnt = 0;
+      const visited2 = new Set<string>();
+      const dfs2 = (v:string, c:number) => {
+        visited2.add(v); comp.set(v,c);
+        for (const nb of radj.get(v) ?? []) if (!visited2.has(nb)) dfs2(nb,c);
+      };
+      for (let i=order.length-1;i>=0;i--) {
+        const v=order[i];
+        if (!visited2.has(v)) { dfs2(v, compCnt); compCnt++; }
+      }
+      // Build SCC groups
+      const sccNodes = new Map<number, string[]>();
+      for (const id of targetIds) {
+        const c = comp.get(id)!;
+        if (!sccNodes.has(c)) sccNodes.set(c, []);
+        sccNodes.get(c)!.push(id);
+      }
+      // Self-loop check: single node with self-wire is SCC
+      for (const w of allWires) if (targetSet.has(w.from.node) && w.from.node===w.to.node) {
+        // ensure it's considered non-trivial (will be size 1 but loop)
+        // mark via flag
+        (sccNodes.get(comp.get(w.from.node)!) as any)._hasSelfLoop = true;
+      }
+      // Build DAG between SCCs
+      const dagAdj = new Map<number, Set<number>>();
+      const dagIndeg = new Map<number, number>();
+      for (let c=0;c<compCnt;c++) { dagAdj.set(c, new Set()); dagIndeg.set(c,0); }
+      for (const w of allWires) {
+        if (!targetSet.has(w.from.node) || !targetSet.has(w.to.node)) continue;
+        const cf = comp.get(w.from.node)!, ct = comp.get(w.to.node)!;
+        if (cf!==ct && !dagAdj.get(cf)!.has(ct)) {
+          dagAdj.get(cf)!.add(ct);
+          dagIndeg.set(ct, (dagIndeg.get(ct)??0)+1);
+        }
+      }
+      // Also add external constraints as DAG anchors (virtual source/sink)
+      // For level, external left (INPUT) → SCC at 0, external right (OUTPUT) → large
+      const sccExternalPred = new Map<number, number>(); // count of external preds
+      const sccExternalSucc = new Map<number, number>();
+      for (const id of targetIds) {
+        const c = comp.get(id)!;
+        sccExternalPred.set(c, (sccExternalPred.get(c)??0) + (inExternal.get(id)?.length ?? 0));
+        sccExternalSucc.set(c, (sccExternalSucc.get(c)??0) + (outExternal.get(id)?.length ?? 0));
+      }
+
+      // 3) Level assignment with DAG longest path + fixed source priority + sink alignment
+      // Kahn topo
+      const topo: number[] = [];
+      const q: number[] = [];
+      for (let c=0;c<compCnt;c++) if ((dagIndeg.get(c)??0)===0) q.push(c);
+      // priority: sources first, and those with external preds first to the left
+      q.sort((a,b)=> (sccExternalPred.get(a)??0) - (sccExternalPred.get(b)??0));
+      const indegCopy = new Map(dagIndeg);
+      while (q.length) {
+        const c = q.shift()!;
+        topo.push(c);
+        for (const nb of dagAdj.get(c) ?? []) {
+          indegCopy.set(nb, (indegCopy.get(nb)??1)-1);
+          if (indegCopy.get(nb)===0) q.push(nb);
+        }
+      }
+      // If cycle remains (should not after SCC), append remaining
+      for (let c=0;c<compCnt;c++) if (!topo.includes(c)) topo.push(c);
+
+      // Longest path: forward distance from sources
+      const sccLevel = new Map<number, number>();
+      for (const c of topo) sccLevel.set(c, -1);
+      // init sources (indeg 0 or isSource inside)
+      for (const c of topo) {
+        const nodesInScc = sccNodes.get(c)!;
+        const hasSource = nodesInScc.some(id=> {
+          const n = allNodes.find(x=> x.id===id)!;
+          return isSource(n);
+        });
+        const hasExternalPred = (sccExternalPred.get(c)??0)>0;
+        if (hasSource && !hasExternalPred) sccLevel.set(c, 0);
+        else if (hasExternalPred) sccLevel.set(c, 1); // after external left
+        else if ((dagIndeg.get(c)??0)===0) sccLevel.set(c, 0);
+      }
+      for (const c of topo) {
+        const cur = sccLevel.get(c) ?? -1;
+        if (cur<0) continue; // unreachable yet
+        for (const nb of dagAdj.get(c) ?? []) {
+          const nbCur = sccLevel.get(nb) ?? -1;
+          if (nbCur < cur+1) sccLevel.set(nb, cur+1);
+        }
+      }
+      // Remaining unreachable: assign 1 or max+1 for sinks
+      let maxLev = Math.max(...Array.from(sccLevel.values()).filter(v=> v>=0), 0);
+      for (const c of topo) {
+        if ((sccLevel.get(c) ?? -1) <0) {
+          const nodesInScc = sccNodes.get(c)!;
+          const sink = nodesInScc.some(id=> isSink(allNodes.find(x=> x.id===id)!));
+          sccLevel.set(c, sink ? maxLev+1 : 1);
+        }
+      }
+      maxLev = Math.max(...Array.from(sccLevel.values()));
+
+      // Align sinks to right (OUTPUT/LED): all sinks should be at maxLev to avoid middle drift
+      // Compute forward and backward distances, then level = forward, sinks forced to max
+      // Also backward distance for stability
+      const backward = new Map<number, number>(); // longest to sink
+      for (const c of [...topo].reverse()) {
+        const succs = [...(dagAdj.get(c) ?? [])];
+        if (!succs.length) {
+          const nodesInScc = sccNodes.get(c)!;
+          const sink = nodesInScc.some(id=> isSink(allNodes.find(x=> x.id===id)!));
+          backward.set(c, sink ? 0 : 0);
+        } else {
+          let best = -1;
+          for (const nb of succs) best = Math.max(best, (backward.get(nb)??0)+1);
+          backward.set(c, best);
+        }
+      }
+      // Re-align sinks: if node is sink and its forward+backward < maxLev, push to maxLev
+      for (const c of topo) {
+        const nodesInScc = sccNodes.get(c)!;
+        const isSinkScc = nodesInScc.some(id=> isSink(allNodes.find(x=> x.id===id)!));
+        if (isSinkScc) {
+          const f = sccLevel.get(c) ?? 0;
+          const b = backward.get(c) ?? 0;
+          // Keep sink at rightmost: set to maxLev, but respect DAG order (must be >= max pred+1)
+          // So max of current and maxLev
+          if (f < maxLev) sccLevel.set(c, maxLev);
+        }
+      }
+      maxLev = Math.max(...Array.from(sccLevel.values()));
+
+      // Expand SCC levels to node levels
       const level = new Map<string, number>();
       for (const id of targetIds) {
-        const n = allNodes.find((x) => x.id === id)!;
-        level.set(id, isSource(n) ? 0 : -1);
+        const c = comp.get(id)!;
+        level.set(id, sccLevel.get(c) ?? 0);
       }
-      let changed = true;
-      let iter = 0;
-      const maxIter = targetIds.length * 2;
-      while (changed && iter < maxIter) {
-        changed = false;
-        iter++;
-        for (const w of allWires) {
-          if (!targetSet.has(w.from.node) || !targetSet.has(w.to.node)) continue;
-          const fromLev = level.get(w.from.node) ?? -1;
-          if (fromLev === -1) continue;
-          const toLev = level.get(w.to.node) ?? -1;
-          if (toLev < fromLev + 1) {
-            level.set(w.to.node, fromLev + 1);
-            changed = true;
-          }
+      // Inside SCC: layout internal separately to keep feedback short
+      // For SCC with >1 node (or self-loop), place them in vertical stack within same x, with Y ordering to minimize feedback length
+      // We'll keep them at same level x, but assign sub-order
+      const sccInternalOrder = new Map<string, number>();
+      for (const [c, ids] of sccNodes) {
+        if (ids.length<=1 && !(ids.length===1 && (sccNodes.get(c) as any)._hasSelfLoop)) {
+          sccInternalOrder.set(ids[0], 0);
+        } else {
+          // Sort inside SCC by original Y to keep deterministic, then assign sub-index
+          const sorted = [...ids].sort((a,b)=> {
+            const na = allNodes.find(x=>x.id===a)!, nb = allNodes.find(x=>x.id===b)!;
+            return na.y - nb.y || a.localeCompare(b);
+          });
+          // For feedback: try to keep driver (source inside SCC) top, feedback target bottom to make wire short
+          // Simple: keep sorted order, feedback wire will be short vertical
+          sorted.forEach((id,i)=> sccInternalOrder.set(id, i));
         }
       }
-      let maxLevel = Math.max(...Array.from(level.values()).filter((v) => v >= 0), 0);
-      for (const id of targetIds) {
-        if ((level.get(id) ?? -1) < 0) {
-          const n = allNodes.find((x) => x.id === id)!;
-          level.set(id, isSink(n) ? maxLevel + 1 : 1);
-        }
-      }
-      maxLevel = Math.max(...Array.from(level.values()));
 
+      // Build layers map by level
       const layers = new Map<number, CNode[]>();
-      for (let i = 0; i <= maxLevel; i++) layers.set(i, []);
+      for (let i=0;i<=maxLev;i++) layers.set(i, []);
       for (const id of targetIds) {
-        const n = allNodes.find((x) => x.id === id)!;
+        const n = allNodes.find(x=> x.id===id)!;
         const lev = level.get(id) ?? 0;
         layers.get(lev)!.push(n);
       }
-      // Initial order by current Y to preserve some stability
+      // Initial order by current Y + internal SCC order to preserve stability
       const orderIndex = new Map<string, number>();
-      for (let lev = 0; lev <= maxLevel; lev++) {
+      const originalOrder = new Map<string, number>();
+      for (let lev=0; lev<=maxLev; lev++) {
         const layerNodes = layers.get(lev)!;
-        layerNodes.sort((a, b) => a.y - b.y);
-        layerNodes.forEach((n, i) => orderIndex.set(n.id, i));
+        layerNodes.sort((a,b)=> {
+          const ao = sccInternalOrder.get(a.id) ?? 0;
+          const bo = sccInternalOrder.get(b.id) ?? 0;
+          if (ao!==bo) return ao-bo;
+          return a.y - b.y || a.id.localeCompare(b.id);
+        });
+        layerNodes.forEach((n,i)=> { orderIndex.set(n.id,i); originalOrder.set(n.id,i); });
       }
-      // Barycenter crossing minimization
-      for (let it = 0; it < 4; it++) {
-        for (let lev = 1; lev <= maxLevel; lev++) {
+
+      // 4) Crossing minimization: iterations = min(10, max(4, layers))
+      const iterCount = Math.min(10, Math.max(4, maxLev+1));
+      // Precompute node sizes for port-aware calc and dynamic gaps
+      const nodeSizeMap = new Map<string, {w:number;h:number}>();
+      for (const n of allNodes) if (targetSet.has(n.id)) {
+        const {w,h} = nodeSize(n as any, defs);
+        nodeSizeMap.set(n.id, {w,h});
+      }
+      // Helper to get port Y offset
+      const portYOffset = (nodeId:string, dir:"in"|"out", idx:number) => {
+        const n = allNodes.find(x=> x.id===nodeId)!;
+        const {h} = nodeSizeMap.get(nodeId) ?? {w:80,h:50};
+        const ins = inMap.get(nodeId)?.length ?? 0; // approximate? use actual port counts via nodeSize logic
+        // Use geometry formula: y = count<=1 ? h/2 : 16 + ((h-28)*idx)/(count-1)
+        // Need true port count: use defs via nodeSize already considered? For simplicity use h mapping
+        // For gate, rowCount = max(ins,outs)
+        // We'll approximate with h
+        const isGateNode = ["AND","OR","NOT","NAND","NOR","XOR","XNOR","BUFFER"].includes(n.type);
+        if (isGateNode) {
+          // gate h already computed, port y same formula as geometry
+          const count = dir==="in" ? (inPorts.get(nodeId)?.length ?? 1) : (outPorts.get(nodeId)?.length ?? 1);
+          // Actually we need total ins/outs, use nodeSize logic: rowCount
+          // fallback to count
+          const c = Math.max(1, count);
+          if (c<=1) return h/2;
+          return 16 + ((h-28)*idx)/Math.max(1,c-1);
+        } else {
+          // For other types, use same
+          const c = dir==="in" ? (inPorts.get(nodeId)?.length ?? 1) : (outPorts.get(nodeId)?.length ?? 1);
+          if (c<=1) return h/2;
+          return 16 + ((h-28)*idx)/Math.max(1,c-1);
+        }
+      };
+
+      for (let it=0; it< iterCount; it++) {
+        for (let lev=1; lev<=maxLev; lev++) {
           const layerNodes = layers.get(lev)!;
           const bary = new Map<string, number>();
           for (const n of layerNodes) {
-            const preds = inMap.get(n.id) ?? [];
-            if (!preds.length) bary.set(n.id, orderIndex.get(n.id) ?? 0);
-            else {
-              const sum = preds.reduce((s, pid) => s + (orderIndex.get(pid) ?? 0), 0);
-              bary.set(n.id, sum / preds.length);
+            const preds = inPorts.get(n.id) ?? [];
+            if (!preds.length) {
+              // also consider external preds: use their current Y (from allNodes) as anchor
+              const ext = inExternal.get(n.id) ?? [];
+              if (ext.length) {
+                const sum = ext.reduce((s, eid)=> {
+                  const en = allNodes.find(x=> x.id===eid);
+                  return s + (en ? en.y : 0);
+                }, 0);
+                // Convert to order-like value: use y directly for external
+                bary.set(n.id, sum/ext.length);
+              } else {
+                bary.set(n.id, orderIndex.get(n.id) ?? 0);
+              }
+            } else {
+              // Port-aware barycenter: predecessor y + predPortY - myPortY
+              let sum = 0;
+              for (const e of preds) {
+                const predOrder = orderIndex.get(e.pred) ?? 0;
+                const predLayer = level.get(e.pred) ?? 0;
+                // Approx pred Y: use orderIndex * Y_GAP (we don't have Y_GAP yet, use order)
+                // For now use order * 90 as proxy; will be refined with actual Y after gaps computed, but use order
+                // Include port offset difference for better alignment
+                const predSize = nodeSizeMap.get(e.pred) ?? {w:80,h:50};
+                const mySize = nodeSizeMap.get(n.id) ?? {w:80,h:50};
+                const predPortY = (()=> {
+                  const cnt = Math.max(1, outPorts.get(e.pred)?.length ?? 1);
+                  const h = predSize.h;
+                  if (cnt<=1) return h/2;
+                  return 16 + ((h-28)*e.predPort)/Math.max(1,cnt-1);
+                })();
+                const myPortY = (()=> {
+                  const cnt = Math.max(1, inPorts.get(n.id)?.length ?? 1);
+                  const h = mySize.h;
+                  if (cnt<=1) return h/2;
+                  return 16 + ((h-28)*e.myPort)/Math.max(1,cnt-1);
+                })();
+                // bary uses order + port delta / Y_GAP (approx 90)
+                sum += predOrder + (predPortY - myPortY)/90;
+              }
+              bary.set(n.id, sum/preds.length);
             }
           }
-          layerNodes.sort((a, b) => (bary.get(a.id) ?? 0) - (bary.get(b.id) ?? 0));
-          layerNodes.forEach((n, i) => orderIndex.set(n.id, i));
+          layerNodes.sort((a,b)=> {
+            const ba = bary.get(a.id) ?? 0, bb = bary.get(b.id) ?? 0;
+            if (Math.abs(ba-bb) > 1e-6) return ba-bb;
+            const oa = originalOrder.get(a.id) ?? 0, ob = originalOrder.get(b.id) ?? 0;
+            if (oa!==ob) return oa-ob;
+            return a.id.localeCompare(b.id);
+          });
+          layerNodes.forEach((n,i)=> orderIndex.set(n.id,i));
         }
-        for (let lev = maxLevel - 1; lev >= 0; lev--) {
+        for (let lev=maxLev-1; lev>=0; lev--) {
           const layerNodes = layers.get(lev)!;
           const bary = new Map<string, number>();
           for (const n of layerNodes) {
-            const succs = outMap.get(n.id) ?? [];
-            bary.set(n.id, succs.length ? succs.reduce((s, pid) => s + (orderIndex.get(pid) ?? 0), 0) / succs.length : orderIndex.get(n.id) ?? 0);
+            const succs = outPorts.get(n.id) ?? [];
+            if (!succs.length) {
+              const ext = outExternal.get(n.id) ?? [];
+              if (ext.length) {
+                const sum = ext.reduce((s,eid)=> {
+                  const en = allNodes.find(x=> x.id===eid);
+                  return s + (en? en.y:0);
+                },0);
+                bary.set(n.id, sum/ext.length);
+              } else {
+                bary.set(n.id, orderIndex.get(n.id) ?? 0);
+              }
+            } else {
+              let sum=0;
+              for (const e of succs) {
+                const succOrder = orderIndex.get(e.succ) ?? 0;
+                const mySize = nodeSizeMap.get(n.id) ?? {w:80,h:50};
+                const succSize = nodeSizeMap.get(e.succ) ?? {w:80,h:50};
+                const myPortY = (()=> {
+                  const cnt = Math.max(1, outPorts.get(n.id)?.length ?? 1);
+                  const h = mySize.h;
+                  if (cnt<=1) return h/2;
+                  return 16 + ((h-28)*e.myPort)/Math.max(1,cnt-1);
+                })();
+                const succPortY = (()=> {
+                  const cnt = Math.max(1, inPorts.get(e.succ)?.length ?? 1);
+                  const h = succSize.h;
+                  if (cnt<=1) return h/2;
+                  return 16 + ((h-28)*e.succPort)/Math.max(1,cnt-1);
+                })();
+                sum += succOrder + (myPortY - succPortY)/90;
+              }
+              bary.set(n.id, sum/succs.length);
+            }
           }
-          layerNodes.sort((a, b) => (bary.get(a.id) ?? 0) - (bary.get(b.id) ?? 0));
-          layerNodes.forEach((n, i) => orderIndex.set(n.id, i));
+          layerNodes.sort((a,b)=> {
+            const ba = bary.get(a.id) ?? 0, bb = bary.get(b.id) ?? 0;
+            if (Math.abs(ba-bb) > 1e-6) return ba-bb;
+            const oa = originalOrder.get(a.id) ?? 0, ob = originalOrder.get(b.id) ?? 0;
+            if (oa!==ob) return oa-ob;
+            return a.id.localeCompare(b.id);
+          });
+          layerNodes.forEach((n,i)=> orderIndex.set(n.id,i));
         }
       }
-      // Assign relative positions around (0,0), then translate to centroid
-      // Use gaps that work for both ortho and curve (180x90 gives forward-flowing beziers and clean ortho elbows)
-      const X_GAP = 180;
-      const Y_GAP = 90;
+
+      // 6) Dynamic gaps based on node size + zoom scale
+      let maxW = 80, maxH = 50;
+      for (const id of targetIds) {
+        const s = nodeSizeMap.get(id);
+        if (s) { maxW = Math.max(maxW, s.w); maxH = Math.max(maxH, s.h); }
+      }
+      // X_GAP = maxNodeWidth +80, Y_GAP = maxNodeHeight+40, snap to GRID, with zoom-aware scaling
+      let X_GAP = maxW + 80;
+      let Y_GAP = maxH + 40;
+      // Clamp for small/large circuits: at least 120/60, at most 220/120
+      X_GAP = Math.max(120, Math.min(220, X_GAP));
+      Y_GAP = Math.max(60, Math.min(120, Y_GAP));
+      X_GAP = snap(X_GAP); Y_GAP = snap(Y_GAP);
+      // If custom defs large, increase a bit
+      if (maxW>90) X_GAP = snap(X_GAP+20);
+
       // Compute relative layout centered at (0,0)
-      const relPos = new Map<string, { x: number; y: number }>();
-      let minRelX = Infinity, maxRelX = -Infinity, minRelY = Infinity, maxRelY = -Infinity;
-      for (let lev = 0; lev <= maxLevel; lev++) {
+      const relPos = new Map<string, { x:number; y:number }>();
+      for (let lev=0; lev<=maxLev; lev++) {
         const layerNodes = layers.get(lev)!;
-        const layerHeight = Math.max(0, (layerNodes.length - 1) * Y_GAP);
-        const startY = -layerHeight / 2;
-        const x = lev * X_GAP - (maxLevel * X_GAP) / 2;
-        layerNodes.forEach((origNode, idx) => {
-          const y = startY + idx * Y_GAP;
-          relPos.set(origNode.id, { x, y });
-          minRelX = Math.min(minRelX, x);
-          maxRelX = Math.max(maxRelX, x);
-          minRelY = Math.min(minRelY, y);
-          maxRelY = Math.max(maxRelY, y);
+        // For SCC with multiple nodes at same level, stack vertically with sub-order
+        // Already ordered, use Y_GAP
+        const layerHeight = Math.max(0, (layerNodes.length-1)*Y_GAP);
+        const startY = -layerHeight/2;
+        const x = lev * X_GAP - (maxLev * X_GAP)/2;
+        layerNodes.forEach((origNode, idx)=> {
+          // If node is part of multi-node SCC, its x is already same level, y offset by internal order
+          // For SCC internal, we already have order, but they share x; to keep feedback short, we could slightly offset x for feedback nodes
+          // Keep simple: same x
+          const y = startY + idx*Y_GAP;
+          relPos.set(origNode.id, {x,y});
         });
       }
-      // Translate relative positions to be centered at the original centroid
-      const newNodes = allNodes.map((n) => {
+      // 7) Snap whole group, preserve internal geometry: dx = snap(centroid)-centroid, not per-node snap
+      const snapDx = snap(centroidX) - centroidX;
+      const snapDy = snap(centroidY) - centroidY;
+      const newNodes = allNodes.map((n)=> {
         if (!targetSet.has(n.id)) return n;
         const rel = relPos.get(n.id)!;
-        return { ...n, x: snap(centroidX + rel.x), y: snap(centroidY + rel.y) };
+        // Preserve symmetry: all nodes get same group snap offset, internal gaps remain exact
+        return { ...n, x: centroidX + rel.x + snapDx, y: centroidY + rel.y + snapDy };
       });
       return { ...d, nodes: newNodes };
     }, "auto layout");
