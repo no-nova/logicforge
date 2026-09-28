@@ -4,3 +4,11 @@ dist/
 .turbo/
 .cache/
 *.log
+
+# Generated media and video rendering files
+starship_video/*.mp4
+starship_video/build_audio/
+starship_video/preview_frames/
+starship_video/test_*.jpg
+starship_video/__pycache__/
+
